@@ -1,0 +1,17 @@
+# Conda environment
+name: scheme_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.13
+  - pip
+  - jax=0.3.*
+  - numpyro=0.10.*
+  - tqdm=4.64.*
+  - networkx=2.8.*
+  - scanpy=1.9.*
+  - pip:
+      - treeo==0.2.1
+      - louvain==0.8.0
+      - leidenalg==0.9.0
