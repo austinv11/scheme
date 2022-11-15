@@ -1,200 +1,18 @@
-import itertools
-import os
-from collections.abc import Iterable
-from dataclasses import dataclass
 from typing import List, Tuple, Union, Optional, Dict, Iterator
 
-import anndata as ad
 import networkx as nx
 # Note that we are using jax to speed up calculations
 import jax.numpy as jnp
 import jax
 from jax import lax
-import treeo as to  # Helps define dataclasses as jax trees
+from matplotlib import pyplot as plt
 from tqdm import tqdm
-import scanpy as sc
-import matplotlib.pyplot as plt
 
+from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas
+from scheme.networks import _sparsify_graph, _generate_gene_backbone, _generate_network_from_backbone
+from scheme.plotting import _draw_network, _make_simulated_adata_plots
 from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
     negative_binomial, jax_jit, consumes_key, jax_vmap
-
-
-def _draw_network(G, title="", colors=None, layout=None, save=False, filename=None):
-    """
-    Draw the gene and cell backbone networks
-    :param G: The backbone network.
-    :param title: The title.
-    :param colors: Discrete matplotlib colormap (optional).
-    :param layout: Callable networkx layout function (optional).
-    :param save: Whether to save to the figures/ directory.
-    :param filename: The filename to save the figure to when the directory is set (optional).
-    :return: Drawn figure.
-    """
-    graph_size = G.number_of_nodes() + G.number_of_edges()
-    if graph_size > 7500 and not save:
-        print("Plotting skipped, very large graph!")
-        return
-
-    if layout is None:
-        layout = nx.spring_layout(G, k=1/(G.number_of_nodes()**.25))
-    else:
-        layout = layout(G)
-    if not colors:
-        type2color = {'ligand': 'blue', 'receptor': 'orange', 'other': 'lightgray', 'activates': 'green', 'inhibits': 'red', None: 'black'}
-    else:
-        type2color = {i: color for (i, color) in enumerate(colors)}
-        type2color[None] = 'black'
-    plt.figure()
-    plt.title(title)
-    nx.draw(G,
-            node_color=[type2color[G.nodes[n].get('type', None)] for n in G],
-            edge_color=[type2color[G.edges[e].get('type', None)] for e in G.edges],
-            node_size=15, width=.5,
-            pos=layout)
-    if save:
-        os.makedirs("figures/", exist_ok=True)
-        if not filename:
-            filename = title
-        plt.savefig(os.path.join("figures/", filename + ".png"))
-    else:
-        plt.show()
-    plt.clf()
-
-
-
-def _sparsify_graph(G, sparsity_factor, rng_key: StatefulPRNGKey):  # Sparsify the graph
-    # Remove edges according to sparsity factor
-    # With a higher likelihood of removing edges from highly central nodes
-    num_edges_to_remove = int(G.number_of_edges() * sparsity_factor)
-    edges = list(G.edges)
-    edge_probs = []
-    for edge in edges:
-        min_degree = min(G.degree(edge[0]), G.degree(edge[1]))
-        edge_probs.append(min_degree)
-    edge_probs = jnp.array(edge_probs)
-    edge_probs = edge_probs / edge_probs.sum()
-    edges_to_remove = jax.random.choice(rng_key(), jnp.arange(len(edges), dtype=int),
-                                    shape=(num_edges_to_remove,),
-                                    replace=False, p=edge_probs)
-
-    for i in edges_to_remove:
-        edge = edges[i]
-        G.remove_edge(edge[0], edge[1])
-
-
-def _generate_gene_backbone(n_genes, sparsity_factor: float, rng_key: StatefulPRNGKey):
-    """
-    Produce a network representing a gene interaction backbone topology.
-    :param n_genes: The number of genes to include.
-    :param sparsity_factor: The percentage of edges to prune out after network generation to prevent a "hairball" type network.
-    :param rng_key: The random number generator key.
-    :return: The final network.
-    """
-    # Generate a random initial regulatory network
-    # Follows a scale-free network random expectation
-    base_gene_backbone = nx.scale_free_graph(n_genes,
-                                             alpha=0.3,  # Prob for adding a new node to an existing node
-                                             beta=0.65,  # Prob for adding a new edge to an existing node
-                                             gamma=0.05,  # Prob for adding a new edge to a new node
-                                             ).reverse()  # Flip the direction of edges for convenience
-
-    # Convert from MultiDiGraph to DiGraph to prevent multiple parallel edges
-    base_gene_backbone = nx.DiGraph(base_gene_backbone)
-
-    # Annotate nodes with gene names and type
-    for node in base_gene_backbone.nodes:
-        base_gene_backbone.nodes[node]["name"] = f"gene_{node}"
-        in_degree = base_gene_backbone.in_degree(node)
-        out_degree = base_gene_backbone.out_degree(node)
-        if in_degree <= 1 and out_degree > 0:
-            base_gene_backbone.nodes[node]["type"] = 'ligand'
-        else:
-            base_gene_backbone.nodes[node]["type"] = 'other'
-    # Annotate receptors
-    lr_pairs = []  # Track the official ligand/receptor pairs
-    for node in base_gene_backbone.nodes:
-        if base_gene_backbone.nodes[node]["type"] == 'ligand':
-            for neighbor in base_gene_backbone.neighbors(node):
-                if base_gene_backbone.nodes[neighbor]["type"] != 'ligand' and base_gene_backbone.out_degree(node) < 5:
-                    base_gene_backbone.nodes[neighbor]["type"] = 'receptor'
-                    lr_pairs.append((node, neighbor))
-
-    # Make network more sparse
-    _sparsify_graph(base_gene_backbone, sparsity_factor, rng_key=rng_key)
-
-    return base_gene_backbone, lr_pairs
-
-
-def _generate_network_from_backbone(backbone: nx.DiGraph, lr_pairs: List[Tuple[int, int]], permutation_strength: float, max_count: int, rng_key: StatefulPRNGKey):
-    """
-    Generate a gene network from a given backbone network.
-    :param backbone: The initial backbone network.
-    :param lr_pairs: Ligand-receptor pair interactions that are enforced.
-    :param permutation_strength: Hyperparameter that modulates the strength of the modifications from the backbone.
-    :param max_count: The max random expected expression.
-    :param rng_key: The random number generator key.
-    :return: The new gene network.
-    """
-    # Copy so we can modify it
-    backbone = backbone.copy()
-    added = 0
-    removed = 0
-
-    # Decorate the graph with self loops
-    SELF_LOOP_PROB = 0.01 * permutation_strength
-    # Decorate the graph with random edges added and removed as noise
-    RANDOM_EDGE_ADD_PROB = .001 * permutation_strength
-    # Probability a new edge that impacts ligands/receptors is kept
-    DECOY_PROB = 0.5 * permutation_strength
-    for node in backbone.nodes:
-        if jax.random.uniform(rng_key()) < SELF_LOOP_PROB:
-            backbone.add_edge(node, node)
-            added += 1
-        for other_node in backbone.nodes:
-            from_node = node
-            to_node = other_node
-            # Swap directions if the order is wrong
-            if backbone.nodes[from_node]['type'] == 'receptor' and backbone.nodes[to_node]['type'] == 'ligand':
-                temp = from_node
-                from_node = to_node
-                to_node = temp
-            # If ligand/receptor interaction, make sure its a real interaction
-            from_type = backbone.nodes[from_node]['type']
-            to_type = backbone.nodes[to_node]['type']
-
-            if len({from_type, to_type} & {'ligand', 'receptor'}) > 0:
-                # Decoy conditions
-                # Ligand/receptor interaction not known
-                wrong_lr = (from_type == 'ligand' and to_type == 'receptor') and ((from_type, to_type) not in lr_pairs)
-                # Interaction for ligand or receptor that is non L/R
-                no_lr = not (from_type == 'ligand' and to_type == 'receptor')
-
-                if wrong_lr or no_lr:
-                    if jax.random.uniform(rng_key()) > DECOY_PROB:
-                        continue
-
-            if jax.random.uniform(rng_key()) < RANDOM_EDGE_ADD_PROB:
-                backbone.add_edge(from_node, to_node)
-                added += 1
-
-    RANDOM_EDGE_REMOVE_PROB = (added / backbone.number_of_edges())
-    for edge in list(backbone.edges()):
-        if jax.random.uniform(rng_key()) < RANDOM_EDGE_REMOVE_PROB:
-            if backbone.has_edge(*edge):
-                backbone.remove_edge(*edge)
-                removed += 1
-
-    # Annotate edges with interaction types
-    for edge in backbone.edges:
-        edge_type = "activates" if jax.random.uniform(rng_key()) < 0.6 else "inhibits"
-        backbone.edges[edge]["type"] = edge_type
-        backbone.edges[edge]["connectivity"] = 1 if edge_type == "activates" else -1
-        backbone.edges[edge]["weight"] = jax.random.uniform(rng_key())
-        backbone.edges[edge]["effect_threshold"] = jax.random.randint(rng_key(), (), 0, max_count+1)
-
-    print(f"Added {added} edges, removed {removed} edges!")
-
-    return backbone
 
 
 @consumes_key(1, 'rng_key')
@@ -266,79 +84,6 @@ def _generate_cell_backbone(n_labels, n_cells, batch_effect, cell_type_interacti
             print("Singleton cells detected, retrying")
 
     return cell_backbone
-
-
-@dataclass(eq=True, unsafe_hash=True)
-class BatchData(to.Tree):
-    """
-    Cached information holder for data batches.
-    """
-    # Number of cells in the batch
-    n_cells: int = to.field(node=False, hash=True)
-    # The base cell interaction network
-    cell_backbone: nx.Graph = to.field(node=False, hash=False)
-    # The base gene interaction networks
-    gene_backbones: Tuple[nx.DiGraph, ...] = to.field(node=False, hash=False)
-    # The connections between cells
-    cell_connectivity: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # The probability of ligand diffusion between cells
-    cell_diffusions: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # Mask representing which genes are markers that don't belong to a cell type
-    anti_marker_mask: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # The probability of gene interaction effects once a threshold is reached
-    effect_probs: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # The threshold for gene interaction effects
-    effect_thresholds: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # Gene interactions within cells
-    gene_connectivities: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-
-
-@dataclass(eq=True, unsafe_hash=True)
-class ExperimentData(to.Tree):
-    """
-    Cached information holder for an experiment/batches.
-    """
-    # The number of genes in the experiment
-    n_genes: int = to.field(node=False, hash=False)
-    # The number of cell types in the experiment
-    n_cell_types: int = to.field(node=False, hash=False)
-    # Mask representing which genes are ligands
-    ligand_mask: jnp.ndarray = to.field(node=True, hash=False, repr=False)
-    # Ligand/receptor pairs
-    ligand_receptor_pairs: Tuple[Tuple[int, int]] = to.field(node=False, hash=False, repr=False)
-    # Cell types to their marker genes
-    cell_type_markers: Tuple[Tuple[int]] = to.field(node=False, hash=False, repr=False)
-    # The locations of the batch boundaries in the counts data
-    batch_indices: Tuple[int] = to.field(node=False, hash=True, repr=False)
-    # Data related to each batch
-    batches: Tuple[BatchData, ...] = to.field(node=True, hash=True)
-
-    @property
-    def n_batches(self):
-        return len(self.batches)
-
-    @property
-    def batch_ranges(self) -> Iterator[Tuple[int, int]]:
-        return zip(self.batch_indices[:-1], self.batch_indices[1:])
-
-
-@dataclass(eq=True, unsafe_hash=True)
-class SimulatedExperimentResults(Iterable, to.Tree):
-    """
-    Cached information holder for a simulated experiment.
-    """
-    # The timesteps saved from the simulation
-    timesteps: Tuple[int] = to.field(node=False, hash=True)
-    # The counts data
-    counts: Tuple[jnp.ndarray] = to.field(node=True, hash=False, repr=False)
-    # Input experiment data
-    experiment_data: ExperimentData = to.field(node=True, hash=True)
-
-    def get_counts(self, timestep: int) -> jnp.ndarray:
-        return self.counts[self.timesteps.index(timestep)]
-
-    def __iter__(self):
-        return iter(zip(self.timesteps, self.counts))
 
 
 def make_batch_matrices(n_cell_types: int,
@@ -470,7 +215,7 @@ def _simulate_counts(cell_simulation_iterations, n_labels, cell_backbones, gene_
 def _multiply_cells_by_genes(cells, gene_effects):
     return cells * gene_effects
 
-# TODO: GPU benchmarks
+
 @consumes_key(4, "rng_key", count=2)
 @jax_jit(static_argnums=(0, 1))
 def _calculate_expression_transition(experiment_info: ExperimentData,
@@ -536,54 +281,6 @@ def _simulate_batches(curr_counts, max_count, count_prob, experiment_info: Exper
         counts_matrix = _calculate_expression_transition(experiment_info, batch_i, first_iter, counts_matrix, rng_key)
 
     return counts_matrix
-
-
-def _simulations_to_adatas(simulation_results: SimulatedExperimentResults) -> Tuple[ad.AnnData, Tuple[ad.AnnData, ...]]:
-    adatas = []
-    ligands = {l for l,r in simulation_results.experiment_data.ligand_receptor_pairs}
-    receptors = {r for l,r in simulation_results.experiment_data.ligand_receptor_pairs}
-    for simulation, matrix in simulation_results:
-        n_genes = matrix.shape[1]
-        adata = ad.AnnData(matrix.astype(jnp.float32))
-        # Metadata
-        adata.uns['simulation'] = True
-        adata.uns['last_timepoint'] = simulation
-        adata.uns['lr_pairs'] = simulation_results.experiment_data.ligand_receptor_pairs
-        adata.obs['simulation_timepoint'] = jnp.repeat(simulation, matrix.shape[0]).astype(int)
-        adata.obs['batch'] = jnp.concatenate([
-            jnp.repeat(i, batch_end-batch_start) for i, (batch_start, batch_end) in enumerate(simulation_results.experiment_data.batch_ranges)
-        ])
-        adata.obs['true_labels'] = jnp.array([
-            simulation_results.experiment_data.batches[batch].cell_backbone.nodes[n]['type'] for (batch, n) in zip(adata.obs['batch'],
-                                                                                                   itertools.chain.from_iterable(b.cell_backbone.nodes for b in simulation_results.experiment_data.batches))
-        ], dtype=int)
-        adata.var['is_ligand'] = [(g in ligands) for g in range(n_genes)]
-        adata.var['is_receptor'] = [(g in receptors) for g in range(n_genes)]
-        for ct, markers in enumerate(simulation_results.experiment_data.cell_type_markers):
-            adata.var[f'is_label_{ct}_marker'] = [(g in markers) for g in range(n_genes)]
-
-        adatas.append(adata)
-
-    # Combine selected adatas to emulate pseudotime
-    full_adata = ad.concat(adatas[::-1],  # Reverse so latest time is prioritized
-                        merge="first",
-                        uns_merge='first')
-    full_adata.uns['last_timepoint'] = 'All'
-
-    # Common pre-processing
-    for adata in (adatas + [full_adata]):
-        # Annotate cells by clustering to replicate unclear cell types
-        sc.tl.pca(adata)
-        # Prep for clustering
-        sc.pp.neighbors(adata, n_pcs=40)
-        # Cluster
-        sc.tl.leiden(adata)
-        sc.tl.louvain(adata)
-        sc.tl.paga(adata)
-        # Annotate cell type by clustering to replicate uncertain labelling
-        adata.obs['cell_type'] = adata.obs['louvain']
-
-    return full_adata, tuple(adatas)
 
 
 def simulate_counts(
@@ -672,22 +369,7 @@ def simulate_counts(
 
     if plot:
         for adata in (adatas + (full_adata,)):
-            timepoint = adata.uns['last_timepoint']
-
-            sc.pl.pca(adata, color=["true_labels", "batch"], title=[f'PCA at t={timepoint} (colored by true labels)',
-                                                                    f'PCA at t={timepoint} (colored by batch)'],
-                      show=not save_plots, save=f"_t{timepoint}.png" if save_plots else None)
-
-            # Plot UMAP
-            sc.pl.paga(adata, plot=True, title=f"PAGA network at t={timepoint}",
-                       show=not save_plots is None, save=f"_t{timepoint}.png" if save_plots else None)
-            sc.tl.umap(adata, init_pos='paga')
-            sc.pl.umap(adata, color=["true_labels", "batch"], title=[f"UMAP at t={timepoint} (colored by true labels)",
-                                                                     f"UMAP at t={timepoint} (colored by batch)"],
-                       show=not save_plots is None, save=f"_labels_t{timepoint}.png" if save_plots else None)
-            sc.pl.umap(adata, color=['leiden', 'louvain'], title=[f"UMAP at t={timepoint} (colored by leiden clusters)",
-                                                                  f"UMAP at t={timepoint} (colored by louvain clusters)"],
-                       show=not save_plots is None, save=f"_cluster_t{timepoint}.png" if save_plots else None)
+            _make_simulated_adata_plots(adata, save=save_plots)
 
 
 if __name__ == "__main__":
