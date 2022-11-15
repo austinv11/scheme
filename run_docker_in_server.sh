@@ -12,4 +12,4 @@ rsync -v -r ../scheme "$SSH_SERVER":/workdir/aav4003/
 rm -f scheme.tar
 # TODO need to run command to install jax with gpu support https://github.com/google/jax/discussions/10323
 echo "Launching docker..."
-ssh "$SSH_SERVER" "cd /workdir/aav4003/scheme && docker1 load -i scheme.tar && bash ./run_docker.sh"
+ssh "$SSH_SERVER" "cd /workdir/aav4003/scheme && docker1 load -i scheme.tar && bash ./run_docker.sh gpu"

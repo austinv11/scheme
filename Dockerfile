@@ -1,41 +1,33 @@
-FROM mambaorg/micromamba
-COPY --chown=$MAMBA_USER:$MAMBA_USER environment.yaml /tmp/environment.yaml
-RUN micromamba install -y -n base -f /tmp/environment.yaml && \
-    micromamba clean --all --yes
+FROM ubuntu:latest
+
+# Based on https://github.com/mamba-org/micromamba-docker/blob/main/Dockerfile
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+RUN chsh -s /bin/bash
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update
+
+# Fix tzdata install
+RUN ln -fs /usr/share/zoneinfo/America/New_York /etc/localtime && \
+    export DEBIAN_FRONTEND=noninteractive && \
+    apt-get install -y tzdata && \
+    dpkg-reconfigure --frontend noninteractive tzdata
+RUN apt-get install -y wget bzip2 ca-certificates curl git openssh-server rsync && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install micromamba
+RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+
+# Install dependencies
+ADD environment.yml /tmp/environment.yml
+RUN micromamba create -y -f /tmp/environment.yml
 
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
 
-# Required to fix dbus and ssh issues
-RUN apt-get update && \
-    (apt-get install -f -y dbus || true) && \
-    dbus-uuidgen > /var/lib/dbus/machine-id && \
-    dpkg --configure -a && \
-    apt-get install -y -f && \
-    apt-get install -y ca-certificates && \
-    update-ca-certificates && \
-    apt-get install -y -f software-properties-common && \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
-    apt-get update && \
-    apt-get install -y build-essential systemd rsync && \
-    apt-get install -y wget libcurl4-gnutls-dev && \
-    apt-get install -y git && \
-    apt-get install -y openssh-server
-
-RUN apt-get install -y -f libcairo2-dev libxt-dev && \
-    apt-get install -y -f libxml2-dev libglpk-dev libhdf5-dev && \
-    apt-get install -y -f libudunits2-dev libgdal-dev gdal-bin && \
-    apt-get install -y -f libproj-dev proj-data proj-bin && \
-    apt-get install -y -f libgeos-dev libnlopt-dev cmake tk-dev && \
-    apt-get install -y -f libbz2-dev gnutls-dev
-
-RUN wget https://github.com/curl/curl/releases/download/curl-7_83_1/curl-7.83.1.tar.gz && \
-    tar -xvf curl-7.83.1.tar.gz && \
-    cd curl-7.83.1 && \
-    ./configure --with-gnutls && \
-    make && \
-    make install && \
-    cd ..
-
+# Install SSH
+RUN micromamba install -y -n scheme_env -c conda-forge openssh
 # SSH stuff
 RUN mkdir /var/run/sshd
 
@@ -55,9 +47,9 @@ RUN /etc/init.d/ssh start
 
 EXPOSE 22
 
-RUN micromamba install -y -c conda-forge openssl=1 llvmlite=0.37.0 clang llvm gcc>=12.1 mkl openssh jupyterlab
+RUN micromamba install -y -n scheme_env -c conda-forge openssl=1 llvmlite=0.37.0 clang llvm gcc>=12.1 mkl openssh jupyterlab
 EXPOSE 8888
-RUN jupyter notebook --allow-root --generate-config
+RUN micromamba run -n scheme_env jupyter notebook --allow-root --generate-config
 
 RUN echo "c = get_config()" >> ~/.jupyter/jupyter_notebook_config.py
 RUN echo "c.NotebookApp.allow_root=True" >> /root/.jupyter/jupyter_notebook_config.py
@@ -70,22 +62,37 @@ RUN echo "c.NotebookApp.open_browser = False" >> ~/.jupyter/jupyter_notebook_con
 RUN echo "c.NotebookApp.port = 8888" >> ~/.jupyter/jupyter_notebook_config.py
 
 # Speedup for numba operations
-RUN conda install -c numba --yes icc_rt
-RUN conda install -c conda-forge -y graphviz
+RUN micromamba install -n scheme_env -c numba --yes icc_rt
+RUN micromamba install -n scheme_env -c conda-forge -y graphviz
 
 # Note there is a mismatch error with conda-forge's h5py so we install it with pip
-RUN conda install -c anaconda --yes hdf5=1.10.6
-RUN conda remove --force --yes h5py
-RUN pip uninstall --yes h5py
-RUN conda install -c conda-forge --yes h5py
+RUN micromamba install -n scheme_env -c anaconda --yes hdf5=1.10.6
+RUN micromamba remove -n scheme_env --force --yes h5py
+RUN micromamba run -n scheme_env pip uninstall --yes h5py
+RUN micromamba install -n scheme_env -c conda-forge --yes h5py scanpy
 
 # Clean temporary files
+RUN micromamba clean --all --yes
 RUN apt-get clean && \
     rm -rf /var/lib/apt/lists/
+
+#RUN conda config --env --set always_yes true
+#RUN conda init bash
+
+#RUN echo "CONDA_CHANGEPS1=false conda activate scheme_env" >> /etc/profile
+
+RUN micromamba shell init --shell=bash --prefix=~/micromamba
+
+# Hack to force conda to activate scheme_env
+# Conda wrapper for python
+RUN echo "#!/usr/bin/env bash" > /usr/local/bin/python-conda
+#RUN echo 'eval "$(micromamba shell hook --shell=bash)"' >> /usr/local/bin/python-conda
+#RUN echo "micromamba activate scheme_env" >> /usr/local/bin/python-conda
+RUN echo "micromamba run -r /root/micromamba -n scheme_env python3 \$@" >> /usr/local/bin/python-conda
+RUN chmod +x /usr/local/bin/python-conda
 
 # Allow for pycharm debugging
 EXPOSE 64456
 EXPOSE 41502
-RUN mkdir /tmp/pycharm_project
 
-ENTRYPOINT ( /usr/sbin/sshd -D & disown ) && jupyter lab --allow-root --ip=0.0.0.0 --port=8888 --no-browser --notebook-dir=/ --NotebookApp.token='' --NotebookApp.password='' --NotebookApp.allow_origin='*' --NotebookApp.allow_remote_access=True
+ENTRYPOINT mkdir -p /tmp/pycharm_project && ( /usr/sbin/sshd -D & disown ) && micromamba run -n scheme_env jupyter lab --allow-root --ip=0.0.0.0 --port=8888 --no-browser --notebook-dir=/ --NotebookApp.token='' --NotebookApp.password='' --NotebookApp.allow_origin='*' --NotebookApp.allow_remote_access=True

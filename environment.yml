@@ -10,7 +10,7 @@ dependencies:
   - numpyro=0.10.*
   - tqdm=4.64.*
   - networkx=2.8.*
-  - scanpy=1.9.*
+  - scanpy
   - pip:
       - treeo==0.2.1
       - louvain==0.8.0
