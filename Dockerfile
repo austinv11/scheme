@@ -24,10 +24,10 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bi
 ADD environment.yml /tmp/environment.yml
 RUN micromamba create -y -f /tmp/environment.yml
 
-ARG MAMBA_DOCKERFILE_ACTIVATE=1
+RUN micromamba shell init --shell=bash --prefix=/root/micromamba
 
 # Install SSH
-RUN micromamba install -y -n scheme_env -c conda-forge openssh
+RUN micromamba install -r /root/micromamba -y -n scheme_env -c conda-forge openssh
 # SSH stuff
 RUN mkdir /var/run/sshd
 
@@ -71,6 +71,9 @@ RUN micromamba remove -n scheme_env --force --yes h5py
 RUN micromamba run -n scheme_env pip uninstall --yes h5py
 RUN micromamba install -n scheme_env -c conda-forge --yes h5py scanpy
 
+# GPU Support
+RUN micromamba install -n scheme_env -y --force-reinstall -c conda-forge -c nvidia jax cuda-nvcc
+
 # Clean temporary files
 RUN micromamba clean --all --yes
 RUN apt-get clean && \
@@ -80,8 +83,6 @@ RUN apt-get clean && \
 #RUN conda init bash
 
 #RUN echo "CONDA_CHANGEPS1=false conda activate scheme_env" >> /etc/profile
-
-RUN micromamba shell init --shell=bash --prefix=~/micromamba
 
 # Hack to force conda to activate scheme_env
 # Conda wrapper for python

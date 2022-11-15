@@ -10,6 +10,5 @@ docker1 save biohpc_aav4003/scheme:latest > scheme.tar
 rsync -v -r ../scheme "$SSH_SERVER":/workdir/aav4003/
 
 rm -f scheme.tar
-# TODO need to run command to install jax with gpu support https://github.com/google/jax/discussions/10323
 echo "Launching docker..."
-ssh "$SSH_SERVER" "cd /workdir/aav4003/scheme && docker1 load -i scheme.tar && bash ./run_docker.sh gpu"
+ssh "$SSH_SERVER" "cd /workdir/aav4003/scheme && docker1 load -i scheme.tar && rm -f scheme.tar && bash ./run_docker.sh gpu"

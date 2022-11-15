@@ -15,7 +15,7 @@ from tqdm import tqdm
 import scanpy as sc
 import matplotlib.pyplot as plt
 
-from .util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
+from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
     negative_binomial, jax_jit, consumes_key, jax_vmap
 
 
