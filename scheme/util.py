@@ -16,6 +16,7 @@ def jax_jit(**kwargs) -> Callable[[F], F]:
     :param kwargs: The arguments to pass to jax.jit()
     """
     def decorator(func: F) -> F:
+        #return func  # To ignore jit, uncomment this line
         return jax.jit(func, **kwargs)
     return decorator
 

@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union, Optional, Dict, Iterator
+from typing import List, Tuple, Union, Optional
 
 import networkx as nx
 # Note that we are using jax to speed up calculations

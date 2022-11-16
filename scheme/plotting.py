@@ -1,5 +1,6 @@
 import os
 
+import jax.numpy as jnp
 import networkx as nx
 import matplotlib.pyplot as plt
 import scanpy as sc
@@ -64,3 +65,42 @@ def _make_simulated_adata_plots(adata, save=False):
     sc.pl.umap(adata, color=['leiden', 'louvain'], title=[f"UMAP at t={timepoint} (colored by leiden clusters)",
                                                           f"UMAP at t={timepoint} (colored by louvain clusters)"],
                show=not save is None, save=f"_cluster_t{timepoint}.png" if save else None)
+
+
+def _draw_voronoi_slice(matrix: jnp.ndarray, slice_idx: int, title: str, save: bool = False):
+    """
+    Draw a voronoi slice of the given matrix.
+    :param matrix: The matrix to draw the slice of.
+    :param slice_idx: The index of the slice to draw.
+    :param title: The title of the plot.
+    :param save: Whether to save the plot.
+    """
+    plt.figure()
+    plt.title(title)
+    # Plot as pixel array, with a discrete colormap
+    plt.imshow(matrix[slice_idx, :, :], cmap='tab20', interpolation='nearest')
+    if save:
+        os.makedirs("figures/", exist_ok=True)
+        plt.savefig(os.path.join("figures/", title + ".png"))
+    else:
+        plt.show()
+    plt.clf()
+
+
+def _draw_voronoi_slices_animation(matrix: jnp.ndarray, title: str, filename: str = "voronoi.gif"):
+    """
+    Draw an animation of the voronoi slices of the given matrix.
+    :param matrix: The matrix to draw the slices of.
+    :param title: The title of the plot.
+    :param filename: The filename to save the animation to.
+    """
+    import matplotlib.animation as animation
+    fig = plt.figure()
+    ims = []
+    for i in range(matrix.shape[0]):
+        im = plt.imshow(matrix[i, :, :], cmap='tab20', interpolation='nearest')
+        ims.append([im])
+    ani = animation.ArtistAnimation(fig, ims, interval=100, blit=True, repeat_delay=500)
+    plt.title(title)
+    os.makedirs("figures/", exist_ok=True)
+    ani.save("figures/" + filename)
