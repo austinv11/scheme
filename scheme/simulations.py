@@ -1,5 +1,8 @@
+import os
 from typing import List, Tuple, Union, Optional
+import os.path as osp
 
+import anndata as ad
 import networkx as nx
 # Note that we are using jax to speed up calculations
 import jax.numpy as jnp
@@ -8,7 +11,7 @@ from jax import lax
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas
+from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas, write_anndata
 from scheme.networks import _sparsify_graph, _generate_gene_backbone, _generate_network_from_backbone
 from scheme.plotting import _draw_network, _make_simulated_adata_plots
 from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
@@ -363,17 +366,34 @@ def simulate_counts(
                                     noise_prob, lr_pairs,
                                     batch_effect, dropout_prob,
                                     key)
+    return simulations
 
+
+def compile_experiment_data(
+        simulation_results: SimulatedExperimentResults,
+        output_dir: str = None,
+        plot: bool = True,
+        save_plots: bool = True) -> Tuple[ad.AnnData, Tuple[ad.AnnData, ...]]:
     print("Annotating cells")
-    full_adata, adatas = _simulations_to_adatas(simulations)
+    full_adata, adatas = _simulations_to_adatas(simulation_results)
 
     if plot:
         for adata in (adatas + (full_adata,)):
             _make_simulated_adata_plots(adata, save=save_plots)
 
+    if output_dir:
+        if not osp.exists(output_dir):
+            os.makedirs(output_dir)
+        write_anndata(full_adata, osp.join(output_dir, "full_adata.h5ad"))
+        for adata in adatas:
+            write_anndata(adata, osp.join(output_dir, f"t{adata.uns['last_timepoint']}.h5ad"))
+
+    return full_adata, adatas
+
 
 if __name__ == "__main__":
     from time import time
     start_time = time()
-    simulate_counts()
+    res = simulate_counts()
+    compile_experiment_data(res, output_dir="simulated_data")
     print("END", time() - start_time)

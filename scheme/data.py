@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Tuple, Iterator, Iterable
 
 import anndata as ad
+import numpy as np
 import scanpy as sc
 import jax.numpy as jnp
 import treeo as to
@@ -88,22 +89,23 @@ def _simulations_to_adatas(simulation_results: SimulatedExperimentResults) -> Tu
     receptors = {r for l, r in simulation_results.experiment_data.ligand_receptor_pairs}
     for simulation, matrix in simulation_results:
         n_genes = matrix.shape[1]
-        adata = ad.AnnData(matrix.astype(jnp.float32))
+        adata = ad.AnnData(np.asarray(matrix.astype(jnp.float32)))
         # Metadata
         adata.uns['simulation'] = True
         adata.uns['last_timepoint'] = simulation
-        adata.uns['lr_pairs'] = simulation_results.experiment_data.ligand_receptor_pairs
-        adata.obs['simulation_timepoint'] = jnp.repeat(simulation, matrix.shape[0]).astype(int)
-        adata.obs['batch'] = jnp.concatenate([
+        adata.uns['ligands'] = [l for l, r in simulation_results.experiment_data.ligand_receptor_pairs]
+        adata.uns['receptors'] = [r for l, r in simulation_results.experiment_data.ligand_receptor_pairs]
+        adata.obs['simulation_timepoint'] = np.asarray(jnp.repeat(simulation, matrix.shape[0]).astype(int)).tolist()
+        adata.obs['batch'] = np.asarray(jnp.concatenate([
             jnp.repeat(i, batch_end - batch_start) for i, (batch_start, batch_end) in
             enumerate(simulation_results.experiment_data.batch_ranges)
-        ])
-        adata.obs['true_labels'] = jnp.array([
+        ])).tolist()
+        adata.obs['true_labels'] = np.asarray(jnp.array([
             simulation_results.experiment_data.batches[batch].cell_backbone.nodes[n]['type'] for (batch, n) in
             zip(adata.obs['batch'],
                 itertools.chain.from_iterable(
                     b.cell_backbone.nodes for b in simulation_results.experiment_data.batches))
-        ], dtype=int)
+        ], dtype=int)).tolist()
         adata.var['is_ligand'] = [(g in ligands) for g in range(n_genes)]
         adata.var['is_receptor'] = [(g in receptors) for g in range(n_genes)]
         for ct, markers in enumerate(simulation_results.experiment_data.cell_type_markers):
@@ -131,3 +133,12 @@ def _simulations_to_adatas(simulation_results: SimulatedExperimentResults) -> Tu
         adata.obs['cell_type'] = adata.obs['louvain']
 
     return full_adata, tuple(adatas)
+
+
+def write_anndata(adata: ad.AnnData, file: str):
+    """
+    Write an AnnData object to a file with standardized compression schemes.
+    """
+    adata.write_h5ad(file,
+                     compression='gzip',
+                     compression_opts=9)

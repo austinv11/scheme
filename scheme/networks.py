@@ -1,3 +1,5 @@
+from typing import Tuple, List
+
 import jax
 import jax.numpy as jnp
 import networkx as nx
