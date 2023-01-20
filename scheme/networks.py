@@ -1,3 +1,4 @@
+import itertools
 from typing import Tuple, List
 
 import jax
@@ -6,6 +7,110 @@ import networkx as nx
 
 from scheme.util import StatefulPRNGKey
 
+
+def duplication_divergence_graph(n_genes: int, p: float, lr_prob: float, rng_key: StatefulPRNGKey) -> nx.DiGraph:
+    """
+    Produces an approximately scale-free network.
+    Inspired by:
+    Nicolau, Miguel, and Marc Schoenauer. "On the evolution of scale-free topologies with a gene regulatory network model." Biosystems 98.3 (2009): 137-148.
+    Ispolatov, Iaroslav, Pavel L. Krapivsky, and Anton Yuryev. "Duplication-divergence model of protein interaction network." Physical review E 71.6 (2005): 061911.
+    :param n_genes: The number of genes to include.
+    :param p: Mutation rate. Higher values lead to more mutations.
+    :param lr_prob: Probability of a gene being mutated to a ligand/receptor.
+    :param rng_key: The random number generator key.
+    :return: Gene-regulatory network.
+    """
+    assert 0 <= p <= 1
+    assert 0 < lr_prob < 1
+
+    G = nx.DiGraph()
+
+    def _make_strength(sign=None):
+        strength = jax.random.normal(rng_key(), shape=())
+        strength = jnp.clip(strength, -1, 1)
+
+        if sign is not None:
+            if jax.lax.ne(jax.numpy.sign(sign), jax.numpy.sign(strength)):
+                strength *= -1
+
+        return strength.item()
+
+    def _add_edge(u, v):
+        G.add_edge(u, v, weight=_make_strength())
+
+    G.add_node(0, type='gene')
+    G.add_node(1, type='gene')
+
+    _add_edge(0, 1)
+    _add_edge(1, 0)
+
+    curr_gene = 2
+    while G.number_of_nodes() < n_genes:
+        # Select a node to duplicate
+        node = jax.random.choice(rng_key(), jnp.arange(G.number_of_nodes(), dtype=int)).item()
+
+        # Add new node
+        G.add_node(curr_gene, **G.nodes[node])
+
+        # Duplicate edges from new node to neighbors of duplicated node
+        for i, neighbor in enumerate(G.predecessors(node)):
+            if not jax.random.bernoulli(rng_key(), p, shape=()).item():
+                G.add_edge(neighbor, curr_gene, **G.edges[neighbor, node])
+                # Redraw the strength of the edge
+                G.edges[neighbor, curr_gene]['weight'] = _make_strength(G.edges[neighbor, node]['weight'])
+
+        # Duplicate edges from neighbors of duplicated node to new node
+        for i, neighbor in enumerate(G.successors(node)):
+            if not jax.random.bernoulli(rng_key(), p, shape=()).item():
+                G.add_edge(curr_gene, neighbor, **G.edges[node, neighbor])
+                # Redraw the strength of the edge
+                G.edges[curr_gene, neighbor]['weight'] = _make_strength(G.edges[node, neighbor]['weight'])
+
+        # Should we add a connection to the progenitor?
+        if jax.random.bernoulli(rng_key(), p, shape=()).item():
+            _add_edge(curr_gene, node)
+
+        if G.nodes[curr_gene]['type'] == 'gene':
+            # Should this new gene be a receptor
+            if jax.random.bernoulli(rng_key(), lr_prob, shape=()).item():
+                G.nodes[curr_gene]['type'] = 'receptor'
+                # Annotate predecessors as ligands randomly
+                for i, neighbor in enumerate(G.predecessors(curr_gene)):
+                    if G.nodes[neighbor]['type'] == 'gene':
+                        if jax.random.bernoulli(rng_key(), lr_prob, shape=()).item():
+                            G.nodes[neighbor]['type'] = 'ligand'
+
+        if G.degree(curr_gene) == 0:
+            # No neighbors, remove and continue
+            G.remove_node(curr_gene)
+            continue
+        else:
+            curr_gene += 1
+
+        # Removals accounted for. Now add new edges
+        # added_edges = jax.random.bernoulli(rng_key(), p, shape=(G.number_of_nodes(),))
+        # for neighbor in jnp.argwhere(added_edges):
+        #     neighbor = neighbor.item()
+        #
+        #     # If the edge exists, we replace it
+        #     if G.has_edge(neighbor, curr_gene):
+        #         G.remove_edge(neighbor, curr_gene)
+        #
+        #     _add_edge(neighbor, curr_gene)
+
+    # Remove any ligands or receptors without partners
+    for node in list(G.nodes):
+        if G.nodes[node]['type'] == 'ligand':
+            # Require at least one successor to be a receptor
+            if not any(G.nodes[neighbor]['type'] == 'receptor' for neighbor in G.successors(node)):
+                G.remove_node(node)
+
+        elif G.nodes[node]['type'] == 'receptor':
+            # Require at least one predecessor to be a ligand
+            if not any(G.nodes[neighbor]['type'] == 'ligand' for neighbor in G.predecessors(node)):
+                G.remove_node(node)
+
+    return G
 
 def _sparsify_graph(G, sparsity_factor, rng_key: StatefulPRNGKey):  # Sparsify the graph
     # Remove edges according to sparsity factor
@@ -54,7 +159,7 @@ def _generate_gene_backbone(n_genes, sparsity_factor: float, rng_key: StatefulPR
         if in_degree <= 1 and out_degree > 0:
             base_gene_backbone.nodes[node]["type"] = 'ligand'
         else:
-            base_gene_backbone.nodes[node]["type"] = 'other'
+            base_gene_backbone.nodes[node]["type"] = 'gene'
     # Annotate receptors
     lr_pairs = []  # Track the official ligand/receptor pairs
     for node in base_gene_backbone.nodes:

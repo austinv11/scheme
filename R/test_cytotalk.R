@@ -3,22 +3,12 @@ library(SingleCellExperiment)
 library(CytoTalk)
 library(reticulate)
 
+
+input_file <- "/tmp/pycharm_project/scheme/simulated_data/full_adata.h5ad"
+output_dir <- "/tmp/cytotalk"
+
 reticulate::use_condaenv("scheme_env", conda = "/opt/conda/bin/conda")
 sc <- import("scanpy")
-
-args <- commandArgs(trailingOnly=TRUE)
-
-if (length(args) == 0) {
-  stop("At least one argument must be supplied (input file).n", call.=FALSE)
-} else if (length(args) == 1) {
-  # default output directory
-  args[2] <- "tmp_cytotalk"
-}
-
-input_file <- args[1]
-input_file = "/tmp/pycharm_project/scheme/simulated_data/full_adata.h5ad"
-output_dir <- args[2]
-
 # Read the counts data
 adata <- sc$read_h5ad(input_file)
 lr_pairs <- data.frame(

@@ -101,6 +101,15 @@ def consumes_key(argnum: int, argname: str, count: int = 1) -> Callable[[F], F]:
 
 @consumes_key(3, 'key')
 @jax_jit(static_argnums=(2,))
+def lognormal(mean, std, shape, key: StatefulPRNGKey):
+    """
+    Sample from a parameterized log-normal distribution.
+    """
+    return jax.numpy.exp(parameterized_normal(mean, std, shape, key))
+
+
+@consumes_key(3, 'key')
+@jax_jit(static_argnums=(2,))
 def parameterized_normal(mean, std, shape, key: StatefulPRNGKey):
     """
     Sample from a parameterized normal distribution

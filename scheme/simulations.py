@@ -15,7 +15,8 @@ from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _
 from scheme.networks import _sparsify_graph, _generate_gene_backbone, _generate_network_from_backbone
 from scheme.plotting import _draw_network, _make_simulated_adata_plots
 from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
-    negative_binomial, jax_jit, consumes_key, jax_vmap
+    negative_binomial, jax_jit, consumes_key, jax_vmap, lognormal
+from scheme.voronoi import jump_flooding
 
 
 @consumes_key(1, 'rng_key')
@@ -85,6 +86,71 @@ def _generate_cell_backbone(n_labels, n_cells, batch_effect, cell_type_interacti
             break
         else:
             print("Singleton cells detected, retrying")
+
+    return cell_backbone
+
+
+# TODO: Optimize by removing the for loops
+def _generate_cell_backbone_from_voronoi(n_labels,
+                                         n_cells,
+                                         batch_effect,
+                                         cell_type_interaction_probs,
+                                         rng_key: StatefulPRNGKey,
+                                         max_seeds_per_type: int = 3):
+    # 3D matrix, so we need to take the 3rd root of n_cells
+    matrix_dimension = int(n_cells**(1/3))
+    # Generate number of random seeds for each cell type
+    n_seeds = jax.random.randint(rng_key(), (n_labels,), 1, max_seeds_per_type)
+    # Make mapping of index to cell type by taking the cumulative sum
+    celltypes2index = jnp.cumsum(n_seeds)
+
+    # Generate voronoi topology
+    voronoi = jump_flooding(matrix_dimension, jnp.sum(n_seeds, dtype=jnp.integer).item(), rng_key=rng_key)
+
+    # Overwrite seed numbers with corresponding cell type
+    for celltype, max_index in enumerate(celltypes2index):
+        last_max_index = 0 if celltype == 0 else celltypes2index[celltype - 1]
+        voronoi = jnp.where((voronoi >= last_max_index) & (voronoi < max_index), celltype, voronoi)
+
+    # Generate cell backbone by building network from voronoi topology and cell type interaction probabilities and exponential decay
+    cell_backbone = nx.DiGraph()
+    for i in range(matrix_dimension):
+        for j in range(matrix_dimension):
+            for k in range(matrix_dimension):
+                celltype = voronoi[i, j, k].item()
+                # Add node to graph
+                cell_label = f"{i}_{j}_{k}"
+                cell_backbone.add_node(cell_label, type=celltype)
+
+    # Log-normal distance for ligand emission
+    ligand_emission_distances = lognormal(0.25, .25, (matrix_dimension, matrix_dimension, matrix_dimension), key=rng_key)
+    # Round to integers
+    ligand_emission_distances = jnp.round(ligand_emission_distances).astype(jnp.int32)
+
+    # Populate edges
+    for i in range(matrix_dimension):
+        for j in range(matrix_dimension):
+            for k in range(matrix_dimension):
+                curr_celltype = voronoi[i, j, k]
+                curr_cell_label = f"{i}_{j}_{k}"
+                emission_distance = ligand_emission_distances[i, j, k]
+                # Add edges to all cells within emission distance
+                offsets = jnp.arange(-emission_distance, emission_distance + 1)
+                all_coord_offsets = jnp.array(jnp.meshgrid(offsets, offsets, offsets, indexing='ij')).T.reshape(-1, 3)
+                for coord_offset in all_coord_offsets:
+                    neighbor_coord = jnp.array([i, j, k]) + coord_offset
+                    # Skip out of bounds
+                    if jnp.any(neighbor_coord < 0) or jnp.any(neighbor_coord >= matrix_dimension):
+                        continue
+                    neighbor_celltype = voronoi[neighbor_coord[0], neighbor_coord[1], neighbor_coord[2]]
+                    neighbor_cell_label = f"{neighbor_coord[0]}_{neighbor_coord[1]}_{neighbor_coord[2]}"
+                    cell_backbone.add_edge(curr_cell_label, neighbor_cell_label, diffusion=cell_type_interaction_probs[curr_celltype, neighbor_celltype].item())
+
+    # Replace string nodes with 0-indexed integers
+    cell_backbone = nx.convert_node_labels_to_integers(cell_backbone, label_attribute='label')
+
+    # Batch effect disrupting connections randomly
+    _sparsify_graph(cell_backbone, _batch_effect_to_sparsity_factor(batch_effect, rng_key=rng_key), rng_key=rng_key)
 
     return cell_backbone
 
@@ -354,7 +420,7 @@ def simulate_counts(
 
     cell_backbones = []
     for batch in range(n_batches):
-        backbone = _generate_cell_backbone(n_labels, n_cells, batch_effect, cell_type_interaction_probs, rng_key=key)
+        backbone = _generate_cell_backbone_from_voronoi(n_labels, n_cells, batch_effect, cell_type_interaction_probs, rng_key=key)
         cell_backbones.append(backbone)
         if plot:
             _draw_network(backbone, f"Batch {batch} Backbone", colors=plt.cm.tab10.colors,
@@ -394,6 +460,9 @@ def compile_experiment_data(
 if __name__ == "__main__":
     from time import time
     start_time = time()
-    res = simulate_counts()
+    res = simulate_counts(
+        n_genes=1000,
+        n_cells=2000,
+    )
     compile_experiment_data(res, output_dir="simulated_data")
     print("END", time() - start_time)

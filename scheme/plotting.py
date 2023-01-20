@@ -17,23 +17,28 @@ def _draw_network(G, title="", colors=None, layout=None, save=False, filename=No
     :param filename: The filename to save the figure to when the directory is set (optional).
     :return: Drawn figure.
     """
-    graph_size = G.number_of_nodes() + G.number_of_edges()
-    if graph_size > 7500 and not save:
-        print("Plotting skipped, very large graph!")
-        return
+    #graph_size = G.number_of_nodes() + G.number_of_edges()
+    #if graph_size > 7500 and not save:
+    #    print("Plotting skipped, very large graph!")
+    #    return
+
+    # Create copy of graph so we can make weights the absolute value
+    G_copy = G.copy()
+    for edge in list(G_copy.edges):
+        G_copy.edges[edge]['weight'] = abs(G_copy.edges[edge]['weight'])
 
     if layout is None:
         layout = nx.spring_layout(G, k=1/(G.number_of_nodes()**.25))
     else:
         layout = layout(G)
     if not colors:
-        type2color = {'ligand': 'blue', 'receptor': 'orange', 'other': 'lightgray', 'activates': 'green', 'inhibits': 'red', None: 'black'}
+        type2color = {'ligand': 'blue', 'receptor': 'orange', 'gene': 'lightgray', 'other': 'lightgray', 'activates': 'green', 'inhibits': 'red', None: 'black'}
     else:
         type2color = {i: color for (i, color) in enumerate(colors)}
         type2color[None] = 'black'
     plt.figure()
     plt.title(title)
-    nx.draw(G,
+    nx.draw(G.reverse(),
             node_color=[type2color[G.nodes[n].get('type', None)] for n in G],
             edge_color=[type2color[G.edges[e].get('type', None)] for e in G.edges],
             node_size=15, width=.5,
@@ -98,7 +103,7 @@ def _draw_voronoi_slices_animation(matrix: jnp.ndarray, title: str, filename: st
     fig = plt.figure()
     ims = []
     for i in range(matrix.shape[0]):
-        im = plt.imshow(matrix[i, :, :], cmap='tab20', interpolation='nearest')
+        im = plt.imshow(matrix[i, :, :], cmap='tab20', interpolation='nearest', title=f"Slice {i+1}/{matrix.shape[0]}")
         ims.append([im])
     ani = animation.ArtistAnimation(fig, ims, interval=100, blit=True, repeat_delay=500)
     plt.title(title)
