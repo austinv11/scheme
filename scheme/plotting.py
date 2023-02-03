@@ -6,12 +6,13 @@ import matplotlib.pyplot as plt
 import scanpy as sc
 
 
-def _draw_network(G, title="", colors=None, layout=None, save=False, filename=None):
+def _draw_network(G, title="", colors=None, color_prop=None, layout=None, save=False, filename=None):
     """
     Draw the gene and cell backbone networks
     :param G: The backbone network.
     :param title: The title.
     :param colors: Discrete matplotlib colormap (optional).
+    :param color_prop: The property to color the nodes by (optional).
     :param layout: Callable networkx layout function (optional).
     :param save: Whether to save to the figures/ directory.
     :param filename: The filename to save the figure to when the directory is set (optional).
@@ -21,6 +22,9 @@ def _draw_network(G, title="", colors=None, layout=None, save=False, filename=No
     #if graph_size > 7500 and not save:
     #    print("Plotting skipped, very large graph!")
     #    return
+
+    if not color_prop:
+        color_prop = 'type'
 
     # Create copy of graph so we can make weights the absolute value
     G_copy = G.copy()
@@ -32,15 +36,20 @@ def _draw_network(G, title="", colors=None, layout=None, save=False, filename=No
     else:
         layout = layout(G)
     if not colors:
-        type2color = {'ligand': 'blue', 'receptor': 'orange', 'gene': 'lightgray', 'other': 'lightgray', 'activates': 'green', 'inhibits': 'red', None: 'black'}
+        type2color = {'ligand': 'blue', 'receptor': 'red', 'ligand/receptor': 'orange', 'gene': 'lightgray', 'other': 'lightgray', 'activates': 'green', 'inhibits': 'red', None: 'black'}
+    elif isinstance(colors, dict):
+        type2color = colors
     else:
         type2color = {i: color for (i, color) in enumerate(colors)}
+
+    if None not in type2color:
         type2color[None] = 'black'
+
     plt.figure()
     plt.title(title)
     nx.draw(G.reverse(),
-            node_color=[type2color[G.nodes[n].get('type', None)] for n in G],
-            edge_color=[type2color[G.edges[e].get('type', None)] for e in G.edges],
+            node_color=[type2color[G.nodes[n].get(color_prop, None)] for n in G],
+            edge_color=[type2color[G.edges[e].get(color_prop, None)] for e in G.edges],
             node_size=15, width=.5,
             pos=layout)
     if save:

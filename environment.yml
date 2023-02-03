@@ -21,6 +21,7 @@ dependencies:
   - tqdm=4.64.*
   - networkx=2.8.*
   - scanpy=1.9.*
+  - plotnine=0.10.*
   - pip:
       - treeo~=0.2.1
       - diffrax~=0.2.2

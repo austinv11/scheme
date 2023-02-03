@@ -12,7 +12,8 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 
 from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas, write_anndata
-from scheme.networks import _sparsify_graph, _generate_gene_backbone, _generate_network_from_backbone
+from scheme.networks import _sparsify_graph, \
+    duplication_divergence_graph, annotate_cell_type_specific_gene_modules, produce_celltype_perturbed_gene_backbone
 from scheme.plotting import _draw_network, _make_simulated_adata_plots
 from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
     negative_binomial, jax_jit, consumes_key, jax_vmap, lognormal
@@ -144,7 +145,9 @@ def _generate_cell_backbone_from_voronoi(n_labels,
                         continue
                     neighbor_celltype = voronoi[neighbor_coord[0], neighbor_coord[1], neighbor_coord[2]]
                     neighbor_cell_label = f"{neighbor_coord[0]}_{neighbor_coord[1]}_{neighbor_coord[2]}"
-                    cell_backbone.add_edge(curr_cell_label, neighbor_cell_label, diffusion=cell_type_interaction_probs[curr_celltype, neighbor_celltype].item())
+                    diffusion = cell_type_interaction_probs[curr_celltype, neighbor_celltype].item()
+                    cell_backbone.add_edge(curr_cell_label, neighbor_cell_label,
+                                           diffusion=diffusion, weight=diffusion)
 
     # Replace string nodes with 0-indexed integers
     cell_backbone = nx.convert_node_labels_to_integers(cell_backbone, label_attribute='label')
@@ -388,8 +391,17 @@ def simulate_counts(
     # Make sure its from lowest to largest
     cell_simulation_iterations.sort()
 
-    # Generate the initial gene backbone
-    base_gene_backbone, lr_pairs = _generate_gene_backbone(n_genes, .25, rng_key=key)
+    # Generate the initial gene backbone nnotated with type (ligand, receptor, gene)
+    base_gene_backbone = duplication_divergence_graph(n_genes, .4, .05, key)
+    # Annoate with random cell-type specific modules (under cell_type, if None then non-specific)
+    base_gene_backbone = annotate_cell_type_specific_gene_modules(base_gene_backbone, n_labels, key)
+    #
+    lr_pairs = []
+    for (u, v) in base_gene_backbone.edges:  # FIXME: Replace type checks with is_ligand/is_receptor
+        if base_gene_backbone.nodes[u]['type'] == 'ligand' and base_gene_backbone.nodes[v]['type'] == 'receptor':
+            lr_pairs.append((u, v))
+
+    #base_gene_backbone, lr_pairs = _generate_gene_backbone(n_genes, .25, rng_key=key)
 
     ligands = {l for (l, r) in lr_pairs}
     receptors = {r for (l, r) in lr_pairs}
@@ -399,27 +411,19 @@ def simulate_counts(
     if plot:
         _draw_network(base_gene_backbone.reverse(), title, save=save_plots, filename="base_gene_backbone")
 
-    # Progressively permute the network to make cell types more different, but still related
-    gene_backbones = [None] * n_labels
-    rand_idx = jax.random.permutation(key(), n_labels)  # Make the cell type relationships random
-    backbone = base_gene_backbone
+    # Generate the gene backbones for each cell type
+    gene_backbones = []
     for i in range(n_labels):
-        backbone = _generate_network_from_backbone(backbone, lr_pairs, jax.random.uniform(key()), max_count, key)
-        gene_backbones[rand_idx[i]] = backbone
-
-    del backbone
-    del rand_idx
+        gene_backbones.append(produce_celltype_perturbed_gene_backbone(base_gene_backbone, i, key))
 
     if plot:
         for i, backbone in enumerate(gene_backbones):
             _draw_network(backbone.reverse(), f"Gene Backbone for: {i}", save=save_plots, filename=f"gene_backbone_{i}")
 
-    # Probability of connections between types
-    cell_type_interaction_probs = jnp.array(
-        [_randomized_proportions(n_labels, prioritize_group=i, rng_key=key).tolist() for i in range(n_labels)])
-
     cell_backbones = []
     for batch in range(n_batches):
+        # Probability of connections between types
+        cell_type_interaction_probs = jnp.array([_randomized_proportions(n_labels, prioritize_group=i, rng_key=key).tolist() for i in range(n_labels)])
         backbone = _generate_cell_backbone_from_voronoi(n_labels, n_cells, batch_effect, cell_type_interaction_probs, rng_key=key)
         cell_backbones.append(backbone)
         if plot:
@@ -461,8 +465,8 @@ if __name__ == "__main__":
     from time import time
     start_time = time()
     res = simulate_counts(
-        n_genes=1000,
-        n_cells=2000,
+        n_genes=250,
+        n_cells=1000,
     )
     compile_experiment_data(res, output_dir="simulated_data")
     print("END", time() - start_time)

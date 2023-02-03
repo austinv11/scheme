@@ -20,7 +20,7 @@ sce <- SingleCellExperiment(
     colData = adata$obs,
     rowData = adata$var
 )
-colnames(sce) <- as.character(colData(sce)$cell_type)
+colnames(sce) <- as.character(colData(sce)$true_labels)  # cell_type: Imperfect labels
 # Cytotalk requires logcounts
 sce <- scuttle::logNormCounts(sce)
 
@@ -28,16 +28,18 @@ sce <- scuttle::logNormCounts(sce)
 # Following https://github.com/tanlabcode/CytoTalk tutorial
 lst_scrna <- CytoTalk::from_single_cell_experiment(sce)
 
-celltypes <- unique(colData(sce)$cell_type)
-celltype_pairs <- expand.grid(celltypes, celltypes, KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+celltypes <- unique(colData(sce)$true_labels)
+celltype_pairs <- combn(celltypes, 2) |> t() |> as.data.frame()
+
+collapsed <- data.frame()
+networks <- data.frame()
 
 # Run Cytotalk on all celltype pairs
-for (i in 1:length(celltype_pairs)) {
+for (i in 1:nrow(celltype_pairs)) {
   celltype1 <- celltype_pairs[i, 1]
   celltype2 <- celltype_pairs[i, 2]
   print(paste0("Running Cytotalk for celltype pair ", celltype1, " and ", celltype2))
 
-  # FIXME
   results <- CytoTalk::run_cytotalk(
     lst_scrna,
     celltype1,
@@ -46,4 +48,15 @@ for (i in 1:length(celltype_pairs)) {
     lrp = lr_pairs,
     dir_out = output_dir
   )
+
+  if (is.null(results$pathways$raw)) {
+    print(paste0("No results for celltype pair ", celltype1, " and ", celltype2))
+    next
+  }
+
+  networks <- rbind(networks, do.call(rbind, results$pathways$raw))
+  lr_results <- results$pathways$df_pval
+  lr_results$celltype1 <- celltype1
+  lr_results$celltype2 <- celltype2
+  collapsed <- rbind(collapsed, lr_results)
 }
