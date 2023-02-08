@@ -18,6 +18,7 @@ def _draw_network(G, title="", colors=None, color_prop=None, layout=None, save=F
     :param filename: The filename to save the figure to when the directory is set (optional).
     :return: Drawn figure.
     """
+    plt.clf()
     #graph_size = G.number_of_nodes() + G.number_of_edges()
     #if graph_size > 7500 and not save:
     #    print("Plotting skipped, very large graph!")
@@ -59,10 +60,11 @@ def _draw_network(G, title="", colors=None, color_prop=None, layout=None, save=F
         plt.savefig(os.path.join("figures/", filename + ".png"))
     else:
         plt.show()
-    plt.clf()
 
 
 def _make_simulated_adata_plots(adata, save=False):
+    plt.clf()
+
     timepoint = adata.uns['last_timepoint']
 
     sc.pl.pca(adata, color=["true_labels", "batch"], title=[f'PCA at t={timepoint} (colored by true labels)',
@@ -89,32 +91,43 @@ def _draw_voronoi_slice(matrix: jnp.ndarray, slice_idx: int, title: str, save: b
     :param title: The title of the plot.
     :param save: Whether to save the plot.
     """
+    plt.clf()
     plt.figure()
+    plt.axis('off')
+    plt.grid(False)
     plt.title(title)
     # Plot as pixel array, with a discrete colormap
-    plt.imshow(matrix[slice_idx, :, :], cmap='tab20', interpolation='nearest')
+    p = plt.imshow(matrix[slice_idx, :, :], cmap='tab20', interpolation='nearest')
     if save:
         os.makedirs("figures/", exist_ok=True)
-        plt.savefig(os.path.join("figures/", title + ".png"))
-    else:
-        plt.show()
-    plt.clf()
+        p.savefig(os.path.join("figures/", title + ".png"))
+    return p
 
 
-def _draw_voronoi_slices_animation(matrix: jnp.ndarray, title: str, filename: str = "voronoi.gif"):
+def _draw_voronoi_slices_animation(matrix: jnp.ndarray, title: str, save: bool = False, filename: str = "voronoi.gif"):
     """
     Draw an animation of the voronoi slices of the given matrix.
     :param matrix: The matrix to draw the slices of.
     :param title: The title of the plot.
+    :param save: Whether to save the animation.
     :param filename: The filename to save the animation to.
     """
     import matplotlib.animation as animation
+    plt.clf()
     fig = plt.figure()
+    plt.axis('off')
+    plt.grid(False)
     ims = []
     for i in range(matrix.shape[0]):
-        im = plt.imshow(matrix[i, :, :], cmap='tab20', interpolation='nearest', title=f"Slice {i+1}/{matrix.shape[0]}")
+        im = plt.imshow(matrix[i, :, :],
+                        cmap='tab20',
+                        interpolation='nearest',
+                        #title=f"Slice {i+1}/{matrix.shape[0]}"
+                        )
         ims.append([im])
-    ani = animation.ArtistAnimation(fig, ims, interval=100, blit=True, repeat_delay=500)
+    ani = animation.ArtistAnimation(fig, ims, interval=750, blit=True, repeat_delay=750)
     plt.title(title)
-    os.makedirs("figures/", exist_ok=True)
-    ani.save("figures/" + filename)
+    if save:
+        os.makedirs("figures/", exist_ok=True)
+        ani.save("figures/" + filename)
+    return ani

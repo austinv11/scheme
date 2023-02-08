@@ -220,5 +220,5 @@ if __name__ == "__main__":
     _draw_voronoi_slice(voronoi_mat, 25, title="Voronoi slice at z=25")
     _draw_voronoi_slice(voronoi_mat, 50, title="Voronoi slice at z=50")
     _draw_voronoi_slice(voronoi_mat, 75, title="Voronoi slice at z=75")
-    _draw_voronoi_slices_animation(voronoi_mat, title="Voronoi slices animation")
+    _draw_voronoi_slices_animation(voronoi_mat, title="Voronoi slices animation", save=True)
 

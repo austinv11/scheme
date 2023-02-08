@@ -1,8 +1,9 @@
 import random
-from typing import Tuple, TypeVar, Callable
+from typing import Tuple, TypeVar, Callable, Optional
 
 import jax
 import treeo as to
+from numpyro.distributions import Exponential
 from numpyro.distributions.conjugate import NegativeBinomial
 
 
@@ -99,6 +100,26 @@ def consumes_key(argnum: int, argname: str, count: int = 1) -> Callable[[F], F]:
     return decorator
 
 
+@jax_jit()
+def _emphasize_group(proportions, prioritized: int):
+    """Emphasize a group of proportions from a list of proportions."""
+    proportions = proportions.at[prioritized].mul(2)
+    return proportions
+
+
+@consumes_key(2, 'rng_key', count=2)
+@jax_jit(static_argnums=(0,))
+def _randomized_proportions(groups: int, prioritize_group: Optional[int], rng_key: StatefulPRNGKey):
+    """Generate random propensities of interaction that sum to 1"""
+    # Bimodal distribution
+    proportions = jax.numpy.clip(bimodal_normal((.25, .75), .25, groups, rng_key[:2]), 0, 1)  # We want groups to have more varied sizes
+    # For cell-cell-communication networks, we want to emphasize the intracluster relationships
+    proportions = jax.lax.cond(prioritize_group is None, lambda prop, prioritize: prop, _emphasize_group,
+                           proportions, prioritize_group)
+    proportions /= proportions.sum()  # Normalize
+    return proportions
+
+
 @consumes_key(3, 'key')
 @jax_jit(static_argnums=(2,))
 def lognormal(mean, std, shape, key: StatefulPRNGKey):
@@ -135,5 +156,17 @@ def negative_binomial(total_count, probs, shape, key: StatefulPRNGKey):
     """
     # We have to use a numpyro distribution since jax has not implemented negative binomial
     distribution = NegativeBinomial(total_count=total_count, probs=probs)
+    return distribution.sample(key, shape)
+
+
+def continuous_bernoulli(lmbda, shape, key: StatefulPRNGKey):
+    """
+    Sample from a continuous bernoulli distribution
+    """
+    # No built in continuous bernoulli in JAX, so we define it an exponential distribution\
+    # Parameterized based on: https://en.wikipedia.org/wiki/Continuous_Bernoulli_distribution
+    eta = jax.numpy.log10(lmbda / (1 - lmbda))
+    # Use the Natural parameter, eta, to define the exponential distribution
+    distribution = Exponential(eta)
     return distribution.sample(key, shape)
 

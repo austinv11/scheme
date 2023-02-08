@@ -1,6 +1,6 @@
 import itertools
 from dataclasses import dataclass
-from typing import Tuple, Iterator, Iterable
+from typing import Tuple, Iterator, Iterable, List
 
 import anndata as ad
 import numpy as np
@@ -81,6 +81,14 @@ class SimulatedExperimentResults(Iterable, to.Tree):
 
     def __iter__(self):
         return iter(zip(self.timesteps, self.counts))
+
+
+def select_lr_pairs(gene_backbone: nx.DiGraph) -> List[Tuple[int, int]]:
+    lr_pairs = []
+    for (u, v) in gene_backbone.edges:  # FIXME: Replace type checks with is_ligand/is_receptor
+        if gene_backbone.nodes[u]['is_ligand'] and gene_backbone.nodes[v]['is_receptor']:
+            lr_pairs.append((u, v))
+    return lr_pairs
 
 
 def _simulations_to_adatas(simulation_results: SimulatedExperimentResults) -> Tuple[ad.AnnData, Tuple[ad.AnnData, ...]]:

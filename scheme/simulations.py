@@ -11,12 +11,13 @@ from jax import lax
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas, write_anndata
+from scheme.data import ExperimentData, BatchData, SimulatedExperimentResults, _simulations_to_adatas, write_anndata, \
+    select_lr_pairs
 from scheme.networks import _sparsify_graph, \
     duplication_divergence_graph, annotate_cell_type_specific_gene_modules, produce_celltype_perturbed_gene_backbone
 from scheme.plotting import _draw_network, _make_simulated_adata_plots
 from scheme.util import StatefulPRNGKey, bimodal_normal, parameterized_normal, \
-    negative_binomial, jax_jit, consumes_key, jax_vmap, lognormal
+    negative_binomial, jax_jit, consumes_key, jax_vmap, lognormal, _randomized_proportions
 from scheme.voronoi import jump_flooding
 
 
@@ -24,28 +25,6 @@ from scheme.voronoi import jump_flooding
 @jax_jit()
 def _batch_effect_to_sparsity_factor(batch_effect, rng_key: StatefulPRNGKey):
     return (jnp.minimum(batch_effect, 1.5)) * jax.random.uniform(rng_key)/4
-
-
-@consumes_key(1, 'rng_key', count=2)
-@jax_jit()
-def _emphasize_group(proportions, prioritized: int, rng_key: StatefulPRNGKey):
-    """Emphasize a group of proportions from a list of proportions."""
-    proportions /= jax.random.randint(rng_key[0], (), 25, 250)  # Down-weigh initial proportions
-    proportions = proportions.at[prioritized].add(jax.random.uniform(rng_key[1]) * (1 - proportions.sum()))  # Make intracluster relationships more important
-    return proportions
-
-
-@consumes_key(2, 'rng_key', count=4)
-@jax_jit(static_argnums=(0,))
-def _randomized_proportions(groups: int, prioritize_group: Optional[int], rng_key: StatefulPRNGKey):
-    """Generate random proportions that sum to 1"""
-    # Bimodal distribution
-    proportions = jnp.clip(bimodal_normal((.25, .75), .25, groups, rng_key[:2]), 0, 1)  # We want groups to have more varied sizes
-    proportions /= proportions.sum()
-    # For cell-cell-communication networks, we want to emphasize the intracluster relationships
-    proportions = lax.cond(prioritize_group is None, lambda prop, prioritize, keys: prop, _emphasize_group,
-                           proportions, prioritize_group, rng_key[2:4])
-    return proportions
 
 
 def _generate_cell_backbone(n_labels, n_cells, batch_effect, cell_type_interaction_probs, rng_key: StatefulPRNGKey):
@@ -355,6 +334,24 @@ def _simulate_batches(curr_counts, max_count, count_prob, experiment_info: Exper
     return counts_matrix
 
 
+def _generate_gene_networks(n_genes: int,
+                            n_labels: int,
+                            key: StatefulPRNGKey) -> Tuple[List[Tuple[int, int]], nx.DiGraph, List[nx.DiGraph]]:
+    # Generate the initial gene backbone annotated with type (ligand, receptor, gene)
+    base_gene_backbone = duplication_divergence_graph(n_genes, .4, .05, key)
+    # Annoate with random cell-type specific modules (under cell_type, if None then non-specific)
+    base_gene_backbone = annotate_cell_type_specific_gene_modules(base_gene_backbone, n_labels, key)
+    lr_pairs = select_lr_pairs(base_gene_backbone)
+
+    #base_gene_backbone, lr_pairs = _generate_gene_backbone(n_genes, .25, rng_key=key)
+    # Generate the gene backbones for each cell type
+    gene_backbones = []
+    for i in range(n_labels):
+        gene_backbones.append(produce_celltype_perturbed_gene_backbone(base_gene_backbone, i, key))
+
+    return lr_pairs, base_gene_backbone, gene_backbones
+
+
 def simulate_counts(
     # Ideal number of genes
     n_genes: int = 250,
@@ -391,17 +388,7 @@ def simulate_counts(
     # Make sure its from lowest to largest
     cell_simulation_iterations.sort()
 
-    # Generate the initial gene backbone nnotated with type (ligand, receptor, gene)
-    base_gene_backbone = duplication_divergence_graph(n_genes, .4, .05, key)
-    # Annoate with random cell-type specific modules (under cell_type, if None then non-specific)
-    base_gene_backbone = annotate_cell_type_specific_gene_modules(base_gene_backbone, n_labels, key)
-    #
-    lr_pairs = []
-    for (u, v) in base_gene_backbone.edges:  # FIXME: Replace type checks with is_ligand/is_receptor
-        if base_gene_backbone.nodes[u]['type'] == 'ligand' and base_gene_backbone.nodes[v]['type'] == 'receptor':
-            lr_pairs.append((u, v))
-
-    #base_gene_backbone, lr_pairs = _generate_gene_backbone(n_genes, .25, rng_key=key)
+    lr_pairs, base_gene_backbone, gene_backbones = _generate_gene_networks(n_genes, n_labels, key)
 
     ligands = {l for (l, r) in lr_pairs}
     receptors = {r for (l, r) in lr_pairs}
@@ -411,12 +398,6 @@ def simulate_counts(
     if plot:
         _draw_network(base_gene_backbone.reverse(), title, save=save_plots, filename="base_gene_backbone")
 
-    # Generate the gene backbones for each cell type
-    gene_backbones = []
-    for i in range(n_labels):
-        gene_backbones.append(produce_celltype_perturbed_gene_backbone(base_gene_backbone, i, key))
-
-    if plot:
         for i, backbone in enumerate(gene_backbones):
             _draw_network(backbone.reverse(), f"Gene Backbone for: {i}", save=save_plots, filename=f"gene_backbone_{i}")
 
