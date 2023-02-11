@@ -3,7 +3,7 @@ from typing import Tuple, TypeVar, Callable, Optional
 
 import jax
 import treeo as to
-from numpyro.distributions import Exponential
+from numpyro.distributions import Exponential, VonMises
 from numpyro.distributions.conjugate import NegativeBinomial
 
 
@@ -25,7 +25,7 @@ def jax_jit(**kwargs) -> Callable[[F], F]:
 def jax_vmap(**kwargs) -> Callable[[F], F]:
     """
     Vmap a function using JAX.
-    :param kwargs: The arguments to pass to jax.jit()
+    :param kwargs: The arguments to pass to jax.vmap()
     """
     def decorator(func: F) -> F:
         return jax.vmap(func, **kwargs)
@@ -159,14 +159,23 @@ def negative_binomial(total_count, probs, shape, key: StatefulPRNGKey):
     return distribution.sample(key, shape)
 
 
-def continuous_bernoulli(lmbda, shape, key: StatefulPRNGKey):
+@consumes_key(2, 'key')
+@jax_jit(static_argnums=(1,))
+def exponential(lmda, shape, key: StatefulPRNGKey):
     """
-    Sample from a continuous bernoulli distribution
+    Sample from an exponential distribution
     """
-    # No built in continuous bernoulli in JAX, so we define it an exponential distribution\
-    # Parameterized based on: https://en.wikipedia.org/wiki/Continuous_Bernoulli_distribution
-    eta = jax.numpy.log10(lmbda / (1 - lmbda))
-    # Use the Natural parameter, eta, to define the exponential distribution
-    distribution = Exponential(eta)
+    distribution = Exponential(rate=lmda)
     return distribution.sample(key, shape)
 
+
+@jax_jit()
+def generalized_logistic(x, L=1, k=1, x0=0):
+    """
+    Apply a logistic function. Default is equivalent to a sigmoid.
+    :param x: The input to the logistic function.
+    :param L: The maximum value of the logistic function (0-L).
+    :param k: The steepness of the logistic function.
+    :param x0: The x-value of the midpoint of the logistic function.
+    """
+    return L / (1 + jax.numpy.exp(-k * (x - x0)))
