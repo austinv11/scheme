@@ -11,6 +11,13 @@ import networkx as nx
 
 
 @dataclass(eq=True, unsafe_hash=True)
+class SingleCellSimulationResults(to.Tree):
+    """
+    Cached information holder for a simulated experiment.
+    """
+
+
+@dataclass(eq=True, unsafe_hash=True)
 class BatchData(to.Tree):
     """
     Cached information holder for data batches.
