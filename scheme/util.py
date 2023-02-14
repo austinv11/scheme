@@ -179,3 +179,33 @@ def generalized_logistic(x, L=1, k=1, x0=0):
     :param x0: The x-value of the midpoint of the logistic function.
     """
     return L / (1 + jax.numpy.exp(-k * (x - x0)))
+
+
+@jax_jit()
+def swap_elements(array: jax.numpy.array, index1, index2) -> jax.numpy.array:
+    """
+    Swap two elements in an array
+    :param array: The array to swap elements in.
+    :param index1: The index of the first element to swap.
+    :param index2: The index of the second element to swap.
+    :return: The updated array.
+    """
+    temp = array[index1]
+    array = array.at[index1].set(array[index2])
+    array = array.at[index2].set(temp)
+    return array
+
+
+@jax_jit()
+def swap_rows(array: jax.numpy.array, row1, row2) -> jax.numpy.array:
+    """
+    Swap two rows (0th dimension) in an array.
+    :param array: The array to swap rows in.
+    :param row1: The index of the first row to swap.
+    :param row2: The index of the second row to swap.
+    :return: The updated array.
+    """
+    temp = array[row1, :]
+    array = array.at[row1, :].set(array[row2, :])
+    array = array.at[row2, :].set(temp)
+    return array
