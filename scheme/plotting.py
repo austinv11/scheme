@@ -65,7 +65,7 @@ def _draw_network(G, title="", colors=None, color_prop=None, layout=None, save=F
 def _make_simulated_adata_plots(adata, save=False):
     plt.clf()
 
-    timepoint = adata.uns['last_timepoint']
+    timepoint = adata.uns['timestep']
 
     sc.pl.pca(adata, color=["true_labels", "batch"], title=[f'PCA at t={timepoint} (colored by true labels)',
                                                             f'PCA at t={timepoint} (colored by batch)'],

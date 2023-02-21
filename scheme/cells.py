@@ -1,11 +1,11 @@
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, List
 
 import jax
 import jax.numpy as jnp
+from tqdm import tqdm
 
-from scheme.data import SingleCellSimulationResults
 from scheme.util import StatefulPRNGKey, DEFAULT_RNG_KEY, jax_jit, consumes_key, exponential, negative_binomial, \
-    jax_vmap, swap_elements, swap_rows
+    jax_vmap, swap_elements, swap_rows, meshgrid_3d, mask_within_radius
 from scheme.voronoi import jump_flooding
 
 
@@ -38,19 +38,21 @@ def initialize_cells(n_cells: int,
 
 
 @jax_jit()
-def _move_cell_step_iteration(voronoi_map: jnp.array,
-                    expression_matrix: jnp.array,
-                    movement_distance_3d: jnp.array,
-                    movement_list: jnp.array,
-                    movement_list_offset: int) -> Tuple[jnp.array, jnp.array, jnp.array, jnp.array, int]:
+def _move_cell_step_iteration(args: tuple) -> Tuple[jnp.array, jnp.array, jnp.array, jnp.array, int]:
     """
     Handle a single step of cell movement.
     Given a 3D voronoi map, associated 2D expression matrix, list of remaining movement steps for cells
     (using 3D coordinates), and a pre-generated list of movement vectors, move cells in the 3D map and
     update the expression matrix accordingly.
     """
+    # unpack args
+    voronoi_map, expression_matrix, movement_distance_3d, movement_list, movement_list_offset = args
+
+    if movement_list.shape[0] == 0:
+        return voronoi_map, expression_matrix, movement_distance_3d, movement_list, movement_list_offset
+
     # Get first cell position to move
-    cell_position = jnp.argwhere(movement_distance_3d > 0)[0]
+    cell_position = jnp.argwhere(movement_distance_3d > 0, size=1)
     remaining_distance = movement_distance_3d[cell_position[0], cell_position[1], cell_position[2]]
     # Update the distance
     movement_distance_3d = movement_distance_3d.at[cell_position[0], cell_position[1], cell_position[2]].set(remaining_distance - 1)
@@ -75,45 +77,63 @@ def _move_cell_step_iteration(voronoi_map: jnp.array,
     return voronoi_map, expression_matrix, movement_distance_3d, movement_list, movement_list_offset
 
 
-@consumes_key(5, 'key', count=3)
 @jax_jit()
-def cell_movement_step(voronoi_map: jnp.array,
-                       expression_matrix: jnp.array,
-                       cell_type_mobility_propensities: jnp.array,
-                       cell_type_mobility_range: jnp.array,
-                       p_move: float,
-                       key: StatefulPRNGKey) -> Tuple[jnp.array, jnp.array]:
+def _apply_mobility_propensity(i, args):
+    x, voronoi_map, mobility_propensities = args
+
+    return x + ((voronoi_map == i) * mobility_propensities[i]), voronoi_map, mobility_propensities
+
+
+@consumes_key(4, 'key', count=2)
+@jax_jit(static_argnums=(3,), compile=True)
+def generate_cell_movements(voronoi_map: jnp.array,
+                            cell_type_mobility_propensities: jnp.array,
+                            cell_type_mobility_range: jnp.array,
+                            cells_to_move: int,
+                            key: StatefulPRNGKey) -> jnp.array:
     """
-    Given the Spatial map of cell types and the corresponding expression matrix, randomly move cells.
+    Given the Spatial map of cell types, generate list of 3D matrix of movement distances corresponding to each cell.
     Additionally given is the propensity of each cell type to move (CT x 1 matrix) and the average rang
     of each cell type when moving (CT x 1 matrix). The p_move parameter defines the random probability of movement.
     """
     # Label cells by propensity to move
     n_celltypes = cell_type_mobility_propensities.shape[0]
     # For each cell type, select the celltype mask
-    movement_propensities = jax.lax.fori_loop(0, n_celltypes, lambda i, x: (x + jnp.full(voronoi_map.shape, cell_type_mobility_propensities[i])), jnp.zeros_like(voronoi_map))
-    # Normalize the movement propensities to be independent probabilities
-    movement_propensities = movement_propensities / jnp.sum(movement_propensities)
-    # Then multiply by the probability of moving
-    movement_propensities = movement_propensities * p_move
+    movement_propensities, _, _ = jax.lax.fori_loop(0, n_celltypes,
+                                                    _apply_mobility_propensity,
+                                                    (jnp.zeros_like(voronoi_map, dtype=jnp.float32), voronoi_map, cell_type_mobility_propensities))
+    # Flatten the propensity array
+    all_positions = meshgrid_3d(jnp.arange(voronoi_map.shape[0]), jnp.arange(voronoi_map.shape[1]), jnp.arange(voronoi_map.shape[2]))
     # Select cells to move by using propensities as a bernoulli mask
-    movement_mask = jax.random.bernoulli(key[0], movement_propensities)
-    # Get the coordinates of the cells to move
-    movement_positions = jnp.argwhere(movement_mask)
+    movement_mask = jax.random.choice(key[0], all_positions, (cells_to_move,),
+                                      p=movement_propensities[all_positions[:, 0], all_positions[:, 1], all_positions[:, 2]])
     # Calculate the distance for each cell to move
     # First get mean distance for each cell type, then get random distance
-    movement_distances = jax.random.poisson(key[1], cell_type_mobility_range[voronoi_map[movement_positions[:, 0], movement_positions[:, 1], movement_positions[:, 2]]])
+    movement_distances = jax.random.poisson(key[1], cell_type_mobility_range[voronoi_map[movement_mask]])
     # Make 3D array to represent the movement distances
     movement_distances_3d = jnp.zeros_like(voronoi_map)
-    movement_distances_3d = movement_distances_3d.at[movement_positions[:, 0], movement_positions[:, 1], movement_positions[:, 2]].set(movement_distances)
+    movement_distances_3d = movement_distances_3d.at[movement_mask].set(movement_distances)
+
+    return movement_distances_3d
+
+
+@consumes_key(4, 'key')
+@jax_jit(static_argnums=(3,))
+def cell_movement_step(voronoi_map: jnp.array,
+                       expression_matrix: jnp.array,
+                       movement_distances_3d: jnp.array,
+                       n_movements: int,
+                       key: StatefulPRNGKey) -> Tuple[jnp.array, jnp.array]:
+    """
+    Given the Spatial map of cell types, the corresponding expression matrix and pre-compiled movement distances, randomly move cells.
+    Note that n_movements should equal sum(movement_distances_3d) for this to work correctly.
+    """
 
     # Move cells
-    # Get total number of movements to allow for static mapping
-    n_movements = jnp.sum(movement_distances)
     # Get the random movements in 3D space
-    movement_list = jax.random.randint(key[2], (n_movements, 3), -1, 2)
+    movement_list = jax.random.randint(key, (n_movements, 3), -1, 2)
     voronoi_map, expression_matrix, _, _, _ = jax.lax.while_loop(
-        lambda _, __, movement_distances_3d, ___, ____: jnp.sum(movement_distances_3d) > 0,
+        lambda args: jnp.sum(args[2]) > 0,  # args[2] is the movement distance 3d matrix
         _move_cell_step_iteration,
         (voronoi_map, expression_matrix, movement_distances_3d, movement_list, 0)
     )
@@ -122,47 +142,43 @@ def cell_movement_step(voronoi_map: jnp.array,
 
 
 @jax_jit()
-def _diffuse_ligand(index: int,
-                    spatial_ligand_matrix: jnp.array,
-                    diffusion_positions_list: jnp.array,
-                    diffusion_vector_list: jnp.array):
-    """
-    Diffuse ligand concentration into space. Index refers to the iteration number for the pre-computed positions.
-    The spatial_ligand_matrix is an NxNxNxL matrix describing spatial ligand concentrations. The diffusion_positions_list
-    and diffusion_vector_list are the pre-computed positions and vectors for position offsets, respectively.
-    """
-    initial_position = diffusion_positions_list[index,]
-    diffusion_vector = diffusion_vector_list[index,]
-    # Add ligand_dimension to diffusion vector by adding placeholder 0 axis
-    diffusion_vector = diffusion_vector[:, jnp.newaxis]
-    # Get final position
-    final_position = initial_position + diffusion_vector
-    # Round to nearest integer
-    final_position = jnp.round(final_position).astype(jnp.int32)
-    # Clip to range
-    final_position = jnp.clip(final_position, 0, spatial_ligand_matrix.shape)
-    # Move ligand
-    spatial_ligand_matrix = spatial_ligand_matrix.at[final_position].add(1)
-    spatial_ligand_matrix = spatial_ligand_matrix.at[initial_position].add(-1)
+def _diffuse_ligands_on_spot(index: int, args):
+    # Average ligands within a sphere
 
-    return spatial_ligand_matrix, diffusion_positions_list, diffusion_vector_list
+    initial_spatial_ligand_matrix, updated_spatial_ligand_matrix, distance_array_start_tracker, diffusion_positions_list, diffusion_ranges = args
+    # Select the starting ligand and position
+    initial_position = diffusion_positions_list[index,]
+    ligand = initial_position[3]
+    # Select the amount of ligand to diffuse
+    count = initial_spatial_ligand_matrix[initial_position[0], initial_position[1], initial_position[2], initial_position[3]]
+    # Get the end range for the precompiled diffusion positions
+    distance_array_end_selection = distance_array_start_tracker + count
+
+    # Get the mask
+    diffusion_mask = mask_within_radius(
+        initial_spatial_ligand_matrix.shape[0], initial_spatial_ligand_matrix.shape[1], initial_spatial_ligand_matrix.shape[2],
+        initial_position[0], initial_position[1], initial_position[2], diffusion_ranges[ligand]
+    )
+
+    updated_spatial_ligand_matrix = updated_spatial_ligand_matrix.at[_cell_index_to_position(diffusion_mask, (initial_spatial_ligand_matrix.shape[0], initial_spatial_ligand_matrix.shape[1], initial_spatial_ligand_matrix.shape[2]))].add(count/jnp.sum(diffusion_mask))
+
+    return initial_spatial_ligand_matrix, updated_spatial_ligand_matrix, distance_array_end_selection, diffusion_positions_list, diffusion_ranges
 
 
 @jax_jit()
 def _celltype_expression_step(celltype: int,
-                              flat_celltype_mask: jnp.array,
-                              expression_matrix: jnp.array,
-                              diffused_ligands: jnp.array,
-                              gene_info: jnp.array,
-                              gene_network_info: jnp.array):
+                              args):
     """
     Handle the expression for a given cell type.
     Given are: a mask of cell type labels for rows in the expression matrix (N x 1), the expression matrix (N x G),
-    The expression matrix that only represents the diffused ligand concentrations (N x G), gene metadata (G x 2), and
+    The expression matrix that only represents the diffused ligand concentrations (N x G), gene metadata (2 x G), and
     gene network interactions (CT x G x G).
     """
+    # Retrieve arguments
+    updated_expression_matrix, flat_celltype_mask, expression_matrix, diffused_ligands, gene_info, gene_network_info = args
+
     # Filter to specific cell type
-    cell_selector = jnp.argwhere(flat_celltype_mask == celltype)
+    cell_selector = jnp.argwhere(flat_celltype_mask == celltype, size=flat_celltype_mask.size).squeeze()
     # Select the effective expression matrix for the cell type
     celltype_expression = expression_matrix[cell_selector, :] + diffused_ligands[cell_selector, :]
     # Select the gene network info for the cell type
@@ -173,12 +189,12 @@ def _celltype_expression_step(celltype: int,
     # Transition step
 
     # Delete non-engaged receptors to prevent activation, first make masks for l/rs
-    ligand_mask = celltype_expression @ is_ligand
-    receptor_mask = celltype_expression @ is_receptor
+    ligand_mask = celltype_expression.at[:, ].mul(is_ligand) > 0
+    receptor_mask = celltype_expression.at[:, ].mul(is_receptor) > 0
     # Then calculate the propagated effects by testing ligands through the network
     lr_transition = ligand_mask @ celltype_gene_network_info
     # Now select receptors with zero activation so that they may be removed
-    non_engaged_receptor_mask = (receptor_mask @ lr_transition) == 0
+    non_engaged_receptor_mask = (receptor_mask * lr_transition) == 0
     # Now remove non-engaged receptors
     celltype_expression -= non_engaged_receptor_mask * celltype_expression
 
@@ -187,69 +203,75 @@ def _celltype_expression_step(celltype: int,
     # Delete diffused ligands
     celltype_expression_effects -= diffused_ligands[cell_selector, :]
     # Add effects to expression matrix
-    expression_matrix = expression_matrix.at[cell_selector, :].add(celltype_expression_effects)
+    updated_expression_matrix = updated_expression_matrix.at[cell_selector, :].add(celltype_expression_effects)
 
     # Clip to 0
-    expression_matrix = jnp.clip(expression_matrix, 0, None)
+    updated_expression_matrix = jnp.clip(updated_expression_matrix, 0, None)
 
-    return flat_celltype_mask, expression_matrix, diffused_ligands, gene_network_info
+    return updated_expression_matrix, flat_celltype_mask, expression_matrix, diffused_ligands, gene_info, gene_network_info
 
 
-@consumes_key(6, 'key', count=4)
-@jax_jit()
+@consumes_key(9, 'key', count=2)
+@jax_jit(static_argnums=(7,8), compile=True)
 def gene_expression_step(voronoi_map: jnp.array,
                          expression_matrix: jnp.array,
-                         ligand_indices: jnp.array,
+                         ligand_indices_mask: jnp.array,
                          ligand_emission_propensities: jnp.array,
                          gene_info: jnp.array,
                          gene_network_info: jnp.array,
                          p_degredation: float,
+                         total_ligands: int,
+                         n_celltypes: int,
                          key: StatefulPRNGKey) -> jnp.array:
     """
     Simulate gene expression and protein degredation, taking into consideration ligand emission properties.
     Given are the celltype-labelled spatial voronoi map (NxNxN), the expression matrix (NxG), the
     indices of ligands in the expression matrix (Lx1), the emission propensities for these ligands (Lx1),
-    gene metadata (Gx2), gene2gene interactions (CTxGxG), and the random probability of degredation.
+    gene metadata (2xG), gene2gene interactions (CTxGxG), and the random probability of degredation.
     """
     # Position and gene dimensions
     all_positions, all_rows = _project_voronoi_to_expression_positions(voronoi_map)
-    flat_celltype_mask = voronoi_map[all_positions[0], all_positions[1], all_positions[2]]
-    spatial_aware_expression = jnp.zeros((voronoi_map.shape[0], voronoi_map.shape[1], voronoi_map.shape[2], expression_matrix.shape[1])).at[all_positions].set(expression_matrix[all_rows])
+    flat_celltype_mask = voronoi_map[all_positions[:,0], all_positions[:,1], all_positions[:,2]]
+    spatial_aware_expression = jnp.zeros((voronoi_map.shape[0], voronoi_map.shape[1], voronoi_map.shape[2], expression_matrix.shape[1])).at[all_positions[:,0], all_positions[:,1], all_positions[:,2], :].set(expression_matrix[all_rows, :])
     # First, simulate ligand diffusion
+    ligand_indices = jnp.argwhere(ligand_indices_mask.squeeze(), size=total_ligands).squeeze()
     diffused_ligands = spatial_aware_expression[:, :, :, ligand_indices]
-    diffused_ligands = diffused_ligands * ligand_emission_propensities.T
+    diffused_ligands = jnp.round(diffused_ligands * ligand_emission_propensities.T).astype(jnp.int32)
+    # Convert ligand indices mask to true indices
     # Remove diffused ligands from the base expression matrix
-    expression_matrix = expression_matrix.at[:, ligand_indices].add(-1*_transform_spatial_ligand_to_expression_matrix(diffused_ligands, expression_matrix, all_positions, all_rows, ligand_indices))
+    expression_matrix -= _transform_spatial_ligand_to_expression_matrix(diffused_ligands, expression_matrix, all_positions, all_rows, ligand_indices)
+    # Ensure that expression is not negative
+    expression_matrix = jnp.clip(expression_matrix, 0, None)
     # Now, shuffle the diffused ligands
     # Note: This is hard coded to a mean range of 1 to make it rare for ligands to diffuse more than 1 cell
     diffusion_ranges = jax.random.poisson(key[0], 1, (ligand_indices.shape[0],))
-    # Create proportions representing the distance of each ligand from the center
-    diffusion_proportions = jax.random.uniform(key[1], (jnp.sum(diffused_ligands).item(),))
-    # Convert proportions to distances
-    diffusion_positions = jnp.argwhere(diffused_ligands > 0)
-    diffusion_distances = diffusion_proportions * diffusion_ranges[diffusion_positions[:, 3]].T
-    # Create random angles for each ligand
-    diffusion_angles = jax.random.uniform(key[2], (diffusion_proportions.shape[0], 2), 0, 2*jnp.pi)
-    # Replicate diffused ligands to match the other arrays
-    diffusion_positions = jnp.repeat(diffusion_positions, diffused_ligands[diffusion_positions], axis=0)
-    # Calculate the offset for each ligand to diffuse by converting spherical coordinates to cartesian
-    diffusion_vectors = jnp.stack([
-        diffusion_distances * jnp.sin(diffusion_angles[:, 0]) * jnp.cos(diffusion_angles[:, 1]),
-        diffusion_distances * jnp.sin(diffusion_angles[:, 0]) * jnp.sin(diffusion_angles[:, 1]),
-        diffusion_distances * jnp.cos(diffusion_angles[:, 0])
-    ])
+    # Get the positions of ligands that don't move to save time
+    static_ligands = jnp.argwhere(diffusion_ranges == 0, size=diffusion_ranges.shape[0]).squeeze()
+    # Remove static ligands from the diffused ligands
+    diffused_ligands = diffused_ligands.at[:, :, :, static_ligands].set(0)
+    # Select all positions of diffused ligands
+    diffusion_positions = jnp.argwhere(diffused_ligands > 0, size=spatial_aware_expression.size)
     # Use a fori loop to retrieve the pre-generated distance, angle, and starting point
     # To move ligands around
-    diffused_ligands, _, _ = jax.lax.fori_loop(0, diffusion_vectors.shape[0], _diffuse_ligand, (diffused_ligands, diffusion_positions, diffusion_vectors))
+
+    _, diffused_ligands, _, _, _ = jax.lax.fori_loop(0, diffusion_positions.shape[0],
+                                               _diffuse_ligands_on_spot,
+                                               (diffused_ligands, jnp.zeros_like(diffused_ligands), 0, diffusion_positions, diffusion_ranges))
     # Convert the spatial ligand matrix, to a flattened expression matrix
     diffused_ligands = _transform_spatial_ligand_to_expression_matrix(diffused_ligands, expression_matrix, all_positions, all_rows, ligand_indices)
+    diffused_ligands = jnp.round(diffused_ligands).astype(jnp.int32)
 
     # Next, simulate ligand-receptor interactions and expression
     # TODO: Should there be explicit cell-type specific receptor expression for sub populations? ex CCR2+ vs CCR2-?
-    _, expression_matrix, _, _ = jax.lax.fori_loop(0, jnp.max(voronoi_map), _celltype_expression_step, (flat_celltype_mask, expression_matrix, diffused_ligands, gene_info, gene_network_info))
+    expression_matrix, _, _, _, _, _ = jax.lax.fori_loop(0, n_celltypes,
+                                                   _celltype_expression_step,
+                                                   (expression_matrix, flat_celltype_mask, expression_matrix, diffused_ligands, gene_info, gene_network_info))
 
     # Finally, simulate degradation. p_degredation represents the average number of proteins per gene per cell that are degraded per time step
-    expression_matrix -= jax.random.poisson(key[3], p_degredation, expression_matrix.shape)
+    expression_matrix -= jax.random.poisson(key[1], p_degredation, expression_matrix.shape)
+
+    # Again clip to ensure no negative expression
+    expression_matrix = jnp.clip(expression_matrix, 0, None)
 
     return expression_matrix
 
@@ -261,13 +283,13 @@ def death_replication_step(voronoi_map: jnp.array,
                            p_death: float,
                            key: StatefulPRNGKey) -> Tuple[jnp.array, jnp.array]:
     """
-    Perform a single death and replicaiton where cells are deleted and then replaced by daughters of nearby cells.
+    Perform a single death and replication where cells are deleted and then replaced by daughters of nearby cells.
     The modified voronoi map and expression matrix are returned, with p_death modulating the proportion of cells to 'kill' each call.
     """
     # Select cells to die (true/false)
     death_mask = jax.random.bernoulli(key[0], p_death, voronoi_map.shape)
     # Get the coordinates of the cells to die
-    death_positions = jnp.argwhere(death_mask)
+    death_positions = jnp.argwhere(death_mask, size=death_mask.size)
     # Select cells that can replicate to fill in the death mask
     to_replicate = _select_neighbors(voronoi_map, death_positions, key[1])
     # Replace the cells that died with the cells that can replicate
@@ -287,8 +309,8 @@ def simulation_iteration(voronoi_map: jnp.array,
                          cell_type_mobility_range: jnp.array,
                          ligand_indices: jnp.array,
                          ligand_emission_propensisties: jnp.array,
+                         gene_info: jnp.array,
                          gene_network_info: jnp.array,
-                         p_move: float,
                          p_degredation: float,
                          p_death: float,
                          key: StatefulPRNGKey) -> Tuple[jnp.array, jnp.array]:
@@ -300,23 +322,31 @@ def simulation_iteration(voronoi_map: jnp.array,
     :param cell_type_mobility_range: The average movement distance for each cell type (CTx1).
     :param ligand_indices: The indices of the ligands in the expression matrix (Lx1).
     :param ligand_emission_propensisties: The propensities for each ligand to be emitted (Lx1).
-    :param gene_network_info: The gene network information (Gx2).
-    :param p_move: The random probaility of cells to move each iteration.
+    :param gene_info: The gene information (2xG).
+    :param gene_network_info: The gene interaction network information (CTxGxG).
     :param p_degredation: The probability for proteins to naturally degrade.
     :param p_death: The proportion of cells to kill each iteration.
     :param key: The random key.
     :return: The updated spatial map and expression matrix.
     """
+    # Generate movement distances
+    overall_movement, _, _ = jax.lax.fori_loop(0, cell_type_mobility_propensities.shape[0],
+                                         lambda i, args: (args[0]+(args[1][i]*(args[2] == i).sum()), args[1], args[2]),
+                                         (0, cell_type_mobility_propensities, voronoi_map))
+    cells_to_move = int(jnp.round(jax.random.randint(key(), (), 0, overall_movement.item())).item())
+    movement_map = generate_cell_movements(voronoi_map, cell_type_mobility_propensities,
+                                           cell_type_mobility_range, cells_to_move, key)
 
     # Move cells in space.
     voronoi_map, expression_matrix = cell_movement_step(voronoi_map, expression_matrix,
-                                                        cell_type_mobility_propensities,
-                                                        cell_type_mobility_range, p_move, key)
+                                                        movement_map, jnp.sum(movement_map).item(), key)
 
     # Simulate gene expression.
+    total_ligands = jnp.sum(ligand_indices).item()
+    n_celltypes = cell_type_mobility_propensities.shape[0]
     expression_matrix = gene_expression_step(voronoi_map, expression_matrix, ligand_indices,
-                                             ligand_emission_propensisties, gene_network_info,
-                                             p_degredation, key)
+                                             ligand_emission_propensisties, gene_info, gene_network_info,
+                                             p_degredation, total_ligands, n_celltypes, key)
 
     # 'Kill' cells and replace them with daughters of nearby cells.
     voronoi_map, expression_matrix = death_replication_step(voronoi_map, expression_matrix, p_death, key)
@@ -328,27 +358,35 @@ def simulate_cells(
         n_cells: int,
         n_celltypes: int,
         n_genes: int,
-        p_move: float,
         p_degredation: float,
         p_death: float,
+        p_expression: float,
+        max_expression: int,
         n_iter: int,
         lr_pairs: Iterable[Tuple[int, int]],
+        gene_info: jnp.array,
+        gene_network_info: jnp.array,
         max_initial_celltype_colonies: int = None,
+        save_iterations: int = 10,
         key: StatefulPRNGKey = DEFAULT_RNG_KEY,
-) -> SingleCellSimulationResults:
+) -> Tuple[List[jnp.array], List[jnp.array]]:
     """
     Generate a spatial distribution of cells and simulate them given a GRN.
 
     :param n_cells: The target number of cells to simulate (can be reduced if there is no integer cubic root).
     :param n_celltypes: The number of cell types to simulate.
     :param n_genes: The number of genes to simulate.
-    :param p_move: The probability of a cell moving each iteration.
     :param p_degredation: The probability for proteins to naturally degrade.
     :param p_death: The proportion of cells to 'kill' each iteration.
+    :param p_expression: The probability for a gene to be expressed in the initial background.
+    :param max_expression: The maximum expression level for a gene in the initial background.
     :param n_iter: The number of iterations for simulations to run.
     :param lr_pairs: The ligand-receptor pairs in the gene network.
+    :param gene_info: The gene information (2xG).
+    :param gene_network_info: The gene interaction network information (CTxGxG).
     :param max_initial_celltype_colonies: The maximum number of initial cell colonies to begin initial growth from.
         Higher numbers yield more heterogeneity. If not specified, will be set to the cube root of n_cells.
+    :param save_iterations: The number of iterations to save the simulation state at (skipping the first save_iterations for warm up).
     :param key: The random number generator key.
     :return: The final expression matrix, and intermediate data.
     """
@@ -362,8 +400,12 @@ def simulate_cells(
                                                  max_initial_celltype_colonies,
                                                  key)
 
+    # Update to true number of cells
+    n_cells = spatial_cell_distribution.size
+
     # Initialize expression matrix
-    expression_matrix = _initial_expression_matrix(n_genes, n_cells, key)
+    expression_matrix = _initial_expression_matrix(n_genes, n_cells, key,
+                                                   max_expression=max_expression, p_expression=p_expression)
 
     # Initialize global meta properties
     celltype_mobility = _generate_celltype_mobility_info(n_celltypes, key)
@@ -376,23 +418,27 @@ def simulate_cells(
     ligand_emission_propensities = _generate_random_emission_propensities(n_ligands, key)
 
     # Perform simulation iterations
-    for i in range(n_iter):
+    spatial_distributions = []
+    expression_matrices = []
+
+    for i in tqdm(range(n_iter), "Simulating cells", total=n_iter):
         spatial_cell_distribution, expression_matrix = simulation_iteration(spatial_cell_distribution,
                                                                             expression_matrix,
                                                                             celltype_mobility_propensity,
                                                                             celltype_mobility_range,
                                                                             ligand_indices,
                                                                             ligand_emission_propensities,
+                                                                            gene_info,
                                                                             gene_network_info,
-                                                                            p_move,
                                                                             p_degredation,
                                                                             p_death,
                                                                             key)
 
+        #if i > save_iterations and i % save_iterations == 0:
+        spatial_distributions.append(spatial_cell_distribution)
+        expression_matrices.append(expression_matrix)
 
-    return SingleCellSimulationResults(
-
-    )
+    return spatial_distributions, expression_matrices
 
 
 # Utility functions for internal datastructures
@@ -429,13 +475,13 @@ def _generate_celltype_mobility_info(n_celltypes: int, key: StatefulPRNGKey) -> 
     """
     return jnp.stack([
         exponential(1, (n_celltypes,), key[0]),
-        jax.random.uniform(key[1], (n_celltypes,))
+        jax.random.uniform(key[1], (n_celltypes,))/4  # Range is 0-0.25 (i.e. most mobile cells move on average every 4 iterations)
     ], axis=1)
 
 
 @consumes_key(2, 'key')
 @jax_jit(static_argnums=(0,1))
-def _initial_expression_matrix(n_genes: int, n_cells: int, key: StatefulPRNGKey, max_expression: int = 100, p_expression: int = 0.5) -> jnp.array:
+def _initial_expression_matrix(n_genes: int, n_cells: int, key: StatefulPRNGKey, max_expression: int = 100, p_expression: float = 0.15) -> jnp.array:
     """
     Generate a random initial expression matrix distributed using a negative binomial distribution.
     The resultant array is N x G where N is the number of cells and G is the number of genes.
@@ -452,7 +498,7 @@ def _select_neighbors(voronoi_map: jnp.array, positions: jnp.array, key: Statefu
     Return a Mx3 array of neighbor positions.
     """
     # Determine all possible 3d offsets
-    offsets = jnp.meshgrid(jnp.arange(-1, 2), jnp.arange(-1, 2), jnp.arange(-1, 2))
+    offsets = meshgrid_3d(jnp.arange(-1, 2), jnp.arange(-1, 2), jnp.arange(-1, 2))
     # Choose the 3d offsets
     selected_offsets = jax.random.randint(key, (positions.shape[0],), 0, len(offsets))
     # Map the selected offset indices to the true offsets
@@ -461,7 +507,7 @@ def _select_neighbors(voronoi_map: jnp.array, positions: jnp.array, key: Statefu
     return jnp.clip((positions + selected_offsets), 0, voronoi_map.shape[0]-1)
 
 
-@jax_vmap(in_axes=(0, None, None))  # For each index
+@jax_vmap(in_axes=(0, None))  # For each index
 @jax_jit(static_argnums=(1,))
 def _cell_index_to_position(index: int, shape: tuple) -> tuple:
     """
@@ -471,14 +517,14 @@ def _cell_index_to_position(index: int, shape: tuple) -> tuple:
     return jnp.unravel_index(index, shape)
 
 
-@jax_vmap(in_axes=(0, None, None))  # For each position
+@jax_vmap(in_axes=(0, None))  # For each position
 @jax_jit(static_argnums=(1,))
-def _position_to_cell_index(position: tuple, shape: tuple) -> int:
+def _position_to_cell_index(position: tuple, shape: tuple) -> jnp.array:
     """
     Given a position in 3D space and the shape of the cube, return the cell expression matrix index.
     The result is a single integer.
     """
-    return jnp.ravel_multi_index(position, shape).item()
+    return jnp.ravel_multi_index(position, shape, mode='clip')
 
 
 @jax_jit()
@@ -486,7 +532,7 @@ def _project_voronoi_to_expression_positions(voronoi: jnp.array):
     """
     Given the voronoi spatial map, return a list of all possible positions, and the corresponding cell row index.
     """
-    all_positions = jnp.meshgrid(jnp.arange(voronoi.shape[0]), jnp.arange(voronoi.shape[1]), jnp.arange(voronoi.shape[2]))
+    all_positions = meshgrid_3d(jnp.arange(voronoi.shape[0]), jnp.arange(voronoi.shape[1]), jnp.arange(voronoi.shape[2]))
     all_rows = _position_to_cell_index(all_positions, voronoi.shape)
     return all_positions, all_rows
 
@@ -503,7 +549,7 @@ def _transform_spatial_ligand_to_expression_matrix(spatial_ligand_matrix: jnp.ar
     """
     # Get ligand expression matrix
     ligand_expression_matrix = jnp.zeros_like(expression_matrix)
-    ligand_expression_matrix = ligand_expression_matrix.at[all_rows, ligand_indices].set(spatial_ligand_matrix[all_positions[0], all_positions[1], all_positions[2], :])
+    ligand_expression_matrix = ligand_expression_matrix.at[all_rows[:, jnp.newaxis], ligand_indices].set(spatial_ligand_matrix[all_positions[:,0], all_positions[:,1], all_positions[:,2], :])
 
     return ligand_expression_matrix
 
@@ -513,7 +559,7 @@ def _get_ligand_indices(n_genes: int, lr_pairs: Iterable[Tuple[int, int]]) -> jn
     Given a list of ligand-receptor pairs and the total number of genes, return an array of ligand indices (G x 1 matrix, where G is number of Genes).
     """
     # TODO: Should we make this jit-able?
-    sorted_distinct_ligands = sorted(set([lr_pair[0] for lr_pair in lr_pairs]))
-    ligand_indices = jnp.zeros((n_genes, 1), dtype=jnp.integer)
-    ligand_indices = ligand_indices.at[sorted_distinct_ligands].set(1)
+    sorted_distinct_ligands = tuple(sorted(set([lr_pair[0] for lr_pair in lr_pairs])))
+    ligand_indices = jnp.zeros((n_genes, 1), dtype=jnp.int32)
+    ligand_indices = ligand_indices.at[sorted_distinct_ligands,].set(1)
     return ligand_indices

@@ -14,11 +14,14 @@ F = TypeVar("F", bound=Callable)  # Allow for type inspection with decorators
 def jax_jit(**kwargs) -> Callable[[F], F]:
     """
     Jit a function using JAX.
-    :param kwargs: The arguments to pass to jax.jit()
+    :param kwargs: The arguments to pass to jax.jit(). If compile is False, this is ignored.
     """
+    compile = kwargs.pop("compile", True)  # Change to False to disable JIT compilation
     def decorator(func: F) -> F:
-        #return func  # To ignore jit, uncomment this line
-        return jax.jit(func, **kwargs)
+        if compile:
+            return jax.jit(func, **kwargs)
+        else:
+            return func
     return decorator
 
 
@@ -209,3 +212,38 @@ def swap_rows(array: jax.numpy.array, row1, row2) -> jax.numpy.array:
     array = array.at[row1, :].set(array[row2, :])
     array = array.at[row2, :].set(temp)
     return array
+
+
+@jax_jit()
+def meshgrid_3d(x, y, z):
+    """
+    Create a 3D meshgrid transformed to follow the expected shape of a 3D array.
+    Ref: https://stackoverflow.com/questions/1208118/using-numpy-to-build-an-array-of-all-combinations-of-two-arrays#comment75712202_35608701
+    :param x: The x-values of the grid.
+    :param y: The y-values of the grid.
+    :param z: The z-values of the grid.
+    :return: The meshgrid.
+    """
+    return jax.numpy.stack(jax.numpy.meshgrid(x, y, z), -1).reshape(-1, 3)
+
+
+@jax_jit(static_argnums=(0, 1, 2))
+def mask_within_radius(shape_x: int, shape_y: int, shape_z: int,
+                       center_x: int, center_y: int, center_z: int, radius: int):
+    """
+    Generate a spherical mask of a given radius.
+    :param shape_x: The x dimension of the mask.
+    :param shape_y: The y dimension of the mask.
+    :param shape_z: The z dimension of the mask.
+    :param center_x: The starting x coordinate of the mask.
+    :param center_y: The starting y coordinate of the mask.
+    :param center_z: The starting z coordinate of the mask.
+    :param radius: The radius.
+    :return: The x,y,z mask.
+    """
+    grid = meshgrid_3d(jax.numpy.arange(shape_x),
+                       jax.numpy.arange(shape_y),
+                       jax.numpy.arange(shape_z))
+    position_mask = jax.numpy.linalg.norm(grid - jax.numpy.array([center_x, center_y, center_z]),
+                                          axis=1) <= radius
+    return position_mask

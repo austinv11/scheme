@@ -22,7 +22,7 @@ def _make_strength(rng_key: StatefulPRNGKey, sign=None):
     return strength.item()
 
 
-def duplication_divergence_graph(n_genes: int, p: float, rec_prop: float, rng_key: StatefulPRNGKey) -> nx.DiGraph:
+def duplication_divergence_graph(n_genes: int, p: float, functional_prop: float, rng_key: StatefulPRNGKey) -> nx.DiGraph:
     """
     Produces an approximately scale-free network.
     Inspired by:
@@ -30,12 +30,12 @@ def duplication_divergence_graph(n_genes: int, p: float, rec_prop: float, rng_ke
     Ispolatov, Iaroslav, Pavel L. Krapivsky, and Anton Yuryev. "Duplication-divergence model of protein interaction network." Physical review E 71.6 (2005): 061911.
     :param n_genes: The number of genes to include.
     :param p: Mutation rate. Higher values lead to more mutations.
-    :param rec_prop: Proportion of genes being a receptor.
+    :param functional_prop: Proportion of genes being a receptor.
     :param rng_key: The random number generator key.
     :return: Gene-regulatory network.
     """
     assert 0 <= p <= 1
-    assert 0 < rec_prop < 1
+    assert 0 < functional_prop < 1
 
     G = nx.DiGraph()
 
@@ -54,7 +54,7 @@ def duplication_divergence_graph(n_genes: int, p: float, rec_prop: float, rng_ke
     _add_edge(2, 2)  # Allow for self-loops
     _add_edge(2, 1)
 
-    curr_gene = 2
+    curr_gene = 3
     while G.number_of_nodes() < n_genes:
         # Select a node to duplicate
         node = jax.random.choice(rng_key(), jnp.arange(G.number_of_nodes(), dtype=int)).item()
@@ -82,11 +82,15 @@ def duplication_divergence_graph(n_genes: int, p: float, rec_prop: float, rng_ke
 
         if not G.nodes[curr_gene]['is_receptor']:
             # Should this new gene be a receptor
-            if jax.random.bernoulli(rng_key(), rec_prop, shape=()).item():
+            if jax.random.bernoulli(rng_key(), functional_prop, shape=()).item():
                 G.nodes[curr_gene]['is_receptor'] = True
                 # Annotate predecessors as ligands
-                for i, neighbor in enumerate(G.predecessors(curr_gene)):
-                    G.nodes[neighbor]['is_ligand'] = True
+                for i, neighbor in enumerate(list(G.predecessors(curr_gene))):
+                    if not G.nodes[neighbor]['is_ligand']:
+                        G.nodes[neighbor]['is_ligand'] = jax.random.bernoulli(rng_key(), functional_prop, shape=()).item()
+                        # if still not ligand, remove the edge to emphasize paths
+                        if not G.nodes[neighbor]['is_ligand'] and not G.nodes[neighbor]['is_receptor']:
+                            G.remove_edge(neighbor, curr_gene)
 
         if G.degree(curr_gene) == 0:
             # No neighbors, remove and continue
@@ -110,18 +114,12 @@ def duplication_divergence_graph(n_genes: int, p: float, rec_prop: float, rng_ke
     for node in list(G.nodes):
         if G.nodes[node]['is_ligand']:
             # Require at least one successor to be a receptor
-            if not any(G.nodes[neighbor]['is_receptor'] for neighbor in G.successors(node)):
-                G.remove_node(node)
-                continue
-            else:
+            if any(G.nodes[neighbor]['is_receptor'] for neighbor in G.successors(node)):
                 G.nodes[node]['type'] = 'ligand'
 
         if G.nodes[node]['is_receptor']:
             # Require at least one predecessor to be a ligand
-            if not any(G.nodes[neighbor]['is_ligand'] for neighbor in G.predecessors(node)):
-                G.remove_node(node)
-                continue
-            else:
+            if any(G.nodes[neighbor]['is_ligand'] for neighbor in G.predecessors(node)):
                 G.nodes[node]['type'] = 'receptor'
 
         if G.nodes[node]['is_ligand'] and G.nodes[node]['is_receptor']:
@@ -242,6 +240,38 @@ def produce_celltype_perturbed_gene_backbone(G: nx.DiGraph,
         Gnew[edge[0]][edge[1]]['weight'] = _make_strength(rng_key)
 
     return Gnew
+
+
+def gene_networks_to_tensor(base_network: nx.DiGraph, networks: List[nx.DiGraph]) -> Tuple[jnp.array, jnp.array]:
+    """
+    Compiles a network into a series of tensors that can be used to simulate gene expression. Dimensions are:
+    Feature matrix = Feature x Gene x Gene
+    Where features are defined as follows:
+    0 to n_celltypes-1: Connections (-inf, inf)
+
+    Gene matrix = Feature x Gene
+    Where features are defined as follows:
+    0: Is Ligand (0/1)
+    1: Is Receptor (0/1)
+    """
+    n_genes = base_network.number_of_nodes()
+    n_celltypes = len(networks)
+
+    features = jnp.zeros((len(networks), n_genes, n_genes), dtype=jnp.float32)
+
+    gene_matrix = jnp.zeros((2, n_genes), dtype=jnp.int32)
+
+    # Is ligand
+    gene_matrix = gene_matrix.at[0,:].set(jnp.array([int(base_network.nodes[g]['is_ligand']) for g in range(n_genes)]))
+
+    # Is receptor
+    gene_matrix = gene_matrix.at[1,:].set(jnp.array([int(base_network.nodes[g]['is_receptor']) for g in range(n_genes)]))
+
+    for celltype in range(n_celltypes):
+        # Connections
+        features = features.at[celltype,].set(nx.to_numpy_array(networks[celltype], dtype=float, weight='weight'))
+
+    return gene_matrix, features
 
 
 def _sparsify_graph(G, sparsity_factor, rng_key: StatefulPRNGKey):  # Sparsify the graph
